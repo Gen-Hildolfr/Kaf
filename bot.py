@@ -1,8 +1,10 @@
 import os
 import sys
+import re
 import json
 import base64
 import sqlite3
+import traceback
 import requests
 import discord
 from discord import app_commands
@@ -17,7 +19,16 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 UNSLOTH_API_URL = os.getenv("UNSLOTH_API_URL", "http://localhost:8000/v1/chat/completions")
 UNSLOTH_API_KEY = os.getenv("UNSLOTH_API_KEY", "")
+UNSLOTH_MODEL = os.getenv("UNSLOTH_MODEL", "ukisai/Swift-Qwen3.8-27B-GGUF")
 DB_NAME = "finance.db"
+
+PLATFORM_MAP = {
+    "cash": "Cash",
+    "bca": "BCA",
+    "jenius": "Jenius",
+    "bibit": "Bibit",
+    "gotrade": "Gotrade",
+}
 
 # ---------------------------------------------------------
 # Database Initialization & Helpers
@@ -207,15 +218,38 @@ def get_recent_summary(tx_type: str, days: int = 7, db_name: str = DB_NAME) -> t
 
 
 # ---------------------------------------------------------
-# Unsloth AI Integration & Slip Parsing
+# Unsloth AI Integration & Robust Slip Parsing
 # ---------------------------------------------------------
+def clean_and_parse_json(text: str) -> dict:
+    """Cleans raw LLM response text, normalizing unicode whitespace (NBSP),
+
+    stripping think tags and code block fences, and extracting valid JSON.
+    """
+    cleaned = text.replace("\u00a0", " ").replace("\ufeff", "").replace("&nbsp;", " ")
+    if "<think>" in cleaned and "</think>" in cleaned:
+        cleaned = cleaned.split("</think>", 1)[1]
+    if "```json" in cleaned:
+        cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in cleaned:
+        cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
+
+    start_idx = cleaned.find("{")
+    end_idx = cleaned.rfind("}")
+    if start_idx != -1 and end_idx != -1:
+        cleaned = cleaned[start_idx : end_idx + 1]
+
+    # Remove any trailing commas before } or ]
+    cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+    return json.loads(cleaned)
+
+
 def query_unsloth_chat(prompt: str) -> str:
     headers = {"Content-Type": "application/json"}
     if UNSLOTH_API_KEY:
         headers["Authorization"] = f"Bearer {UNSLOTH_API_KEY}"
 
     payload = {
-        "model": os.getenv("UNSLOTH_MODEL", "default"),
+        "model": UNSLOTH_MODEL,
         "messages": [
             {"role": "user", "content": prompt}
         ]
@@ -223,7 +257,10 @@ def query_unsloth_chat(prompt: str) -> str:
     response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=60)
     response.raise_for_status()
     data = response.json()
-    return data["choices"][0]["message"]["content"]
+    reply = data["choices"][0]["message"]["content"]
+    if "<think>" in reply and "</think>" in reply:
+        reply = reply.split("</think>", 1)[1].strip()
+    return reply
 
 
 def query_unsloth_vision(image_bytes: bytes) -> dict:
@@ -262,7 +299,7 @@ def query_unsloth_vision(image_bytes: bytes) -> dict:
         headers["Authorization"] = f"Bearer {UNSLOTH_API_KEY}"
 
     payload = {
-        "model": os.getenv("UNSLOTH_MODEL", "default"),
+        "model": UNSLOTH_MODEL,
         "messages": [
             {
                 "role": "user",
@@ -279,23 +316,20 @@ def query_unsloth_vision(image_bytes: bytes) -> dict:
     response.raise_for_status()
     data = response.json()
     raw_content = data["choices"][0]["message"]["content"].strip()
-
-    cleaned = raw_content
-    if "```json" in cleaned:
-        cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
-    elif "```" in cleaned:
-        cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
-
-    return json.loads(cleaned)
+    return clean_and_parse_json(raw_content)
 
 
 def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
-    kind = data.get("kind")
-    platform = data.get("platform")
-    target_platform = data.get("target_platform")
+    kind = str(data.get("kind") or "").strip().lower()
+    platform_raw = str(data.get("platform") or "").strip()
+    platform = PLATFORM_MAP.get(platform_raw.lower(), platform_raw)
+
+    target_raw = str(data.get("target_platform") or "").strip()
+    target_platform = PLATFORM_MAP.get(target_raw.lower(), target_raw if target_raw else "External")
+
     amount = float(data.get("amount") or 0.0)
-    category = data.get("category") or "General"
-    note = data.get("note") or ""
+    category = str(data.get("category") or "General").strip()
+    note = str(data.get("note") or "").strip()[:1000]
     ticker = data.get("ticker")
     units_added = float(data.get("units_added") or 0.0)
 
@@ -384,13 +418,12 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
         conn.commit()
         conn.close()
 
-        target_str = target_platform if target_platform else "External"
         embed = discord.Embed(
             title="🔁 Transfer Recorded",
             color=discord.Color.blue()
         )
         embed.add_field(name="From", value=platform, inline=True)
-        embed.add_field(name="To", value=target_str, inline=True)
+        embed.add_field(name="To", value=target_platform, inline=True)
         embed.add_field(name="Amount", value=f"{amount:,.2f} {currency}", inline=True)
         embed.add_field(name="Note", value=note if note else "-", inline=False)
         embed.add_field(name="Remaining Balance", value=f"{new_balance:,.2f} {currency}", inline=False)
@@ -468,6 +501,7 @@ async def on_message(message: discord.Message):
                     await message.reply(reply_text)
                 except Exception as e:
                     print(f"Chat error: {e}")
+                    traceback.print_exc()
                     await message.reply("Sorry, I encountered an error talking to the AI service.")
         return
 
@@ -488,7 +522,11 @@ async def on_message(message: discord.Message):
                 await message.reply(embed=embed)
             except Exception as e:
                 print(f"Error processing image slip: {e}")
-                await message.reply("❌ Unable to parse this receipt or financial slip. Please ensure the image is clear and contains transaction details.")
+                traceback.print_exc()
+                await message.reply(
+                    "❌ Unable to parse this receipt or financial slip. "
+                    "Please ensure the image is clear and contains transaction details."
+                )
     else:
         # Attachment is not an image; fall back to text chat if message text is present
         if message.content.strip():
@@ -498,6 +536,7 @@ async def on_message(message: discord.Message):
                     await message.reply(reply_text)
                 except Exception as e:
                     print(f"Chat error: {e}")
+                    traceback.print_exc()
                     await message.reply("Sorry, I encountered an error talking to the AI service.")
 
 
@@ -647,7 +686,7 @@ if __name__ == "__main__":
         assert isinstance(breakdown["investments"].get("Gotrade"), (int, float))
         print("Part A checks PASSED.")
 
-        # Part B: Feature 4 Routing Verification with 4 Mocks
+        # Part B: Feature 4 Database Routing Verification with 4 Mocks
         print("\n[PART B: Feature 4 Database Routing Verification]")
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -674,20 +713,21 @@ if __name__ == "__main__":
         assert isinstance(embed_expense, discord.Embed)
         print("1. Mock Expense (BCA -50,000) processed -> Red Embed")
 
-        # 2. Mock "transfer" (BCA Rp 500.000 to Bibit)
-        mock_transfer = {
-            "kind": "transfer",
-            "platform": "BCA",
-            "target_platform": "Bibit",
-            "amount": 500000.0,
-            "category": "Transfer",
-            "note": "Top up Bibit from BCA",
-            "ticker": None,
-            "units_added": None
-        }
+        # 2. Mock "transfer" (BCA Rp 500.000 to Bibit) - Also testing raw NBSP text parsing
+        raw_transfer_text_with_nbsp = """{\r
+\xa0 "kind": "transfer",\r
+\xa0 "platform": "BCA",\r
+\xa0 "target_platform": "External",\r
+\xa0 "amount": 500000.0,\r
+\xa0 "category": "transfer",\r
+\xa0 "note": "m-Transfer BERHASIL to BANK BRI 119801002584539 FIONNA CALYSTA TIKHI, BIAYA Rp 2,500.00, Ref 950312026091623221451299A21D4F5F05D",\r
+\xa0 "ticker": null,\r
+\xa0 "units_added": null\r
+}"""
+        mock_transfer = clean_and_parse_json(raw_transfer_text_with_nbsp)
         embed_transfer = process_parsed_slip(mock_transfer)
         assert isinstance(embed_transfer, discord.Embed)
-        print("2. Mock Transfer (BCA -500,000 to Bibit) processed -> Blue Embed")
+        print("2. Mock Transfer with NBSP (BCA -500,000 to External) parsed & processed -> Blue Embed")
 
         # 3. Mock "order_filled" (Bibit SMMF +251.05 units)
         mock_order = {
