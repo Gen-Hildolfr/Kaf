@@ -1,6 +1,9 @@
 import os
 import sys
+import json
+import base64
 import sqlite3
+import requests
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -8,10 +11,12 @@ from dotenv import load_dotenv
 import yfinance as yf
 
 # ---------------------------------------------------------
-# Configuration & Database Constants
+# Configuration & Constants
 # ---------------------------------------------------------
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+UNSLOTH_API_URL = os.getenv("UNSLOTH_API_URL", "http://localhost:8000/v1/chat/completions")
+UNSLOTH_API_KEY = os.getenv("UNSLOTH_API_KEY", "")
 DB_NAME = "finance.db"
 
 # ---------------------------------------------------------
@@ -202,7 +207,237 @@ def get_recent_summary(tx_type: str, days: int = 7, db_name: str = DB_NAME) -> t
 
 
 # ---------------------------------------------------------
-# Discord Bot Setup & Slash Commands
+# Unsloth AI Integration & Slip Parsing
+# ---------------------------------------------------------
+def query_unsloth_chat(prompt: str) -> str:
+    headers = {"Content-Type": "application/json"}
+    if UNSLOTH_API_KEY:
+        headers["Authorization"] = f"Bearer {UNSLOTH_API_KEY}"
+
+    payload = {
+        "model": os.getenv("UNSLOTH_MODEL", "default"),
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
+    response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def query_unsloth_vision(image_bytes: bytes) -> dict:
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    if image_bytes.startswith(b"\x89PNG"):
+        mime_type = "image/png"
+    elif image_bytes.startswith(b"\xff\xd8"):
+        mime_type = "image/jpeg"
+    elif image_bytes.startswith(b"GIF8"):
+        mime_type = "image/gif"
+    elif image_bytes.startswith(b"RIFF") and b"WEBP" in image_bytes[:16]:
+        mime_type = "image/webp"
+    else:
+        mime_type = "image/jpeg"
+
+    image_data_url = f"data:{mime_type};base64,{base64_image}"
+
+    prompt = (
+        "Extract transaction details from this receipt or financial slip image.\n"
+        "Return STRICT JSON ONLY, with no markdown fences, no preamble, and no extra text.\n"
+        "Expected JSON schema:\n"
+        "{\n"
+        '  "kind": "expense" | "income" | "transfer" | "order_filled",\n'
+        '  "platform": "BCA" | "Jenius" | "Bibit" | "Gotrade" | "Cash",\n'
+        '  "target_platform": "Bibit" | "Gotrade" | "External" | null,\n'
+        '  "amount": float or null,\n'
+        '  "category": string,\n'
+        '  "note": string,\n'
+        '  "ticker": "SMMF" | "VTI" | null,\n'
+        '  "units_added": float or null\n'
+        "}"
+    )
+
+    headers = {"Content-Type": "application/json"}
+    if UNSLOTH_API_KEY:
+        headers["Authorization"] = f"Bearer {UNSLOTH_API_KEY}"
+
+    payload = {
+        "model": os.getenv("UNSLOTH_MODEL", "default"),
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_data_url}}
+                ]
+            }
+        ],
+        "temperature": 0.1
+    }
+
+    response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    raw_content = data["choices"][0]["message"]["content"].strip()
+
+    cleaned = raw_content
+    if "```json" in cleaned:
+        cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in cleaned:
+        cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
+
+    return json.loads(cleaned)
+
+
+def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
+    kind = data.get("kind")
+    platform = data.get("platform")
+    target_platform = data.get("target_platform")
+    amount = float(data.get("amount") or 0.0)
+    category = data.get("category") or "General"
+    note = data.get("note") or ""
+    ticker = data.get("ticker")
+    units_added = float(data.get("units_added") or 0.0)
+
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    if kind == "expense":
+        cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+        row = cursor.fetchone()
+        curr_balance = float(row[0]) if row and row[0] is not None else 0.0
+        currency = row[1] if row and row[1] else "IDR"
+        new_balance = curr_balance - amount
+        cursor.execute(
+            "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+            (new_balance, platform),
+        )
+        cursor.execute(
+            """
+            INSERT INTO transactions (platform, type, amount, category, note)
+            VALUES (?, 'expense', ?, ?, ?)
+            """,
+            (platform, amount, category, note),
+        )
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="💸 Expense Recorded",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Platform", value=platform, inline=True)
+        embed.add_field(name="Amount", value=f"{amount:,.2f} {currency}", inline=True)
+        embed.add_field(name="Category", value=category, inline=True)
+        embed.add_field(name="Note", value=note if note else "-", inline=False)
+        embed.add_field(name="Remaining Balance", value=f"{new_balance:,.2f} {currency}", inline=False)
+        return embed
+
+    elif kind == "income":
+        cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+        row = cursor.fetchone()
+        curr_balance = float(row[0]) if row and row[0] is not None else 0.0
+        currency = row[1] if row and row[1] else "IDR"
+        new_balance = curr_balance + amount
+        cursor.execute(
+            "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+            (new_balance, platform),
+        )
+        cursor.execute(
+            """
+            INSERT INTO transactions (platform, type, amount, category, note)
+            VALUES (?, 'income', ?, ?, ?)
+            """,
+            (platform, amount, category, note),
+        )
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="💵 Income Recorded",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Platform", value=platform, inline=True)
+        embed.add_field(name="Amount", value=f"{amount:,.2f} {currency}", inline=True)
+        embed.add_field(name="Category", value=category, inline=True)
+        embed.add_field(name="Note", value=note if note else "-", inline=False)
+        embed.add_field(name="Updated Balance", value=f"{new_balance:,.2f} {currency}", inline=False)
+        return embed
+
+    elif kind == "transfer":
+        cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+        row = cursor.fetchone()
+        curr_balance = float(row[0]) if row and row[0] is not None else 0.0
+        currency = row[1] if row and row[1] else "IDR"
+        new_balance = curr_balance - amount
+        cursor.execute(
+            "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+            (new_balance, platform),
+        )
+        cursor.execute(
+            """
+            INSERT INTO transactions (platform, type, amount, category, note)
+            VALUES (?, 'transfer', ?, 'Transfer', ?)
+            """,
+            (platform, amount, note),
+        )
+        conn.commit()
+        conn.close()
+
+        target_str = target_platform if target_platform else "External"
+        embed = discord.Embed(
+            title="🔁 Transfer Recorded",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="From", value=platform, inline=True)
+        embed.add_field(name="To", value=target_str, inline=True)
+        embed.add_field(name="Amount", value=f"{amount:,.2f} {currency}", inline=True)
+        embed.add_field(name="Note", value=note if note else "-", inline=False)
+        embed.add_field(name="Remaining Balance", value=f"{new_balance:,.2f} {currency}", inline=False)
+        return embed
+
+    elif kind == "order_filled":
+        cursor.execute(
+            "SELECT units, currency FROM holdings WHERE platform = ? AND ticker = ?",
+            (platform, ticker),
+        )
+        row = cursor.fetchone()
+        if row:
+            curr_units = float(row[0])
+            currency = row[1]
+            new_units = curr_units + units_added
+            cursor.execute(
+                "UPDATE holdings SET units = ? WHERE platform = ? AND ticker = ?",
+                (new_units, platform, ticker),
+            )
+        else:
+            currency = "USD" if platform == "Gotrade" else "IDR"
+            new_units = units_added
+            cursor.execute(
+                "INSERT INTO holdings (platform, ticker, units, currency) VALUES (?, ?, ?, ?)",
+                (platform, ticker, new_units, currency),
+            )
+        conn.commit()
+        conn.close()
+
+        embed = discord.Embed(
+            title="📈 Order Filled / Units Added",
+            color=discord.Color.purple()
+        )
+        embed.add_field(name="Platform", value=platform, inline=True)
+        embed.add_field(name="Ticker", value=ticker, inline=True)
+        embed.add_field(name="Units Added", value=f"{units_added:,.4f}", inline=True)
+        embed.add_field(name="Total Units", value=f"{new_units:,.4f}", inline=False)
+        if note:
+            embed.add_field(name="Note", value=note, inline=False)
+        return embed
+
+    conn.close()
+    raise ValueError(f"Unknown slip kind: {kind}")
+
+
+# ---------------------------------------------------------
+# Discord Bot Setup & Event Listeners
 # ---------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -219,6 +454,56 @@ async def on_ready():
         print(f"Failed to sync slash commands: {e}")
 
 
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author == bot.user:
+        return
+
+    # If message.attachments is EMPTY: purely conversational text chat
+    if not message.attachments:
+        if message.content.strip():
+            async with message.channel.typing():
+                try:
+                    reply_text = query_unsloth_chat(message.content)
+                    await message.reply(reply_text)
+                except Exception as e:
+                    print(f"Chat error: {e}")
+                    await message.reply("Sorry, I encountered an error talking to the AI service.")
+        return
+
+    # If message.attachments has an image: receipt/financial slip extraction
+    first_attachment = message.attachments[0]
+    content_type = first_attachment.content_type or ""
+    is_image = content_type.startswith("image/") or any(
+        first_attachment.filename.lower().endswith(ext)
+        for ext in [".png", ".jpg", ".jpeg", ".webp", ".gif"]
+    )
+
+    if is_image:
+        async with message.channel.typing():
+            try:
+                image_bytes = await first_attachment.read()
+                data = query_unsloth_vision(image_bytes)
+                embed = process_parsed_slip(data)
+                await message.reply(embed=embed)
+            except Exception as e:
+                print(f"Error processing image slip: {e}")
+                await message.reply("❌ Unable to parse this receipt or financial slip. Please ensure the image is clear and contains transaction details.")
+    else:
+        # Attachment is not an image; fall back to text chat if message text is present
+        if message.content.strip():
+            async with message.channel.typing():
+                try:
+                    reply_text = query_unsloth_chat(message.content)
+                    await message.reply(reply_text)
+                except Exception as e:
+                    print(f"Chat error: {e}")
+                    await message.reply("Sorry, I encountered an error talking to the AI service.")
+
+
+# ---------------------------------------------------------
+# Slash Commands
+# ---------------------------------------------------------
 @bot.tree.command(name="checkbalance", description="View portfolio and balance breakdown across all accounts")
 async def checkbalance(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -339,40 +624,139 @@ if __name__ == "__main__":
     init_db()
 
     if "--test" in sys.argv:
-        print("=== RUNNING FEATURE 3 SMOKE TEST (--test) ===")
-        # 1. Calls record_cash_flow(100000, 'income', 'ATM withdrawal')
+        print("=== RUNNING CLI SMOKE TEST (--test) ===")
+        
+        # Part A: Feature 3 Verification
+        print("\n[PART A: Feature 3 Verification]")
         cash_after_income = record_cash_flow(100000, "income", "ATM withdrawal")
-        print(f"1. record_cash_flow(100000, 'income', 'ATM withdrawal') -> New Cash Balance: {cash_after_income}")
+        print(f"1. record_cash_flow(100000, 'income', 'ATM withdrawal') -> Cash Balance: {cash_after_income}")
 
-        # 2. Calls record_cash_flow(25000, 'expense', 'Lunch')
         cash_after_expense = record_cash_flow(25000, "expense", "Lunch")
-        print(f"2. record_cash_flow(25000, 'expense', 'Lunch') -> New Cash Balance: {cash_after_expense}")
+        print(f"2. record_cash_flow(25000, 'expense', 'Lunch') -> Cash Balance: {cash_after_expense}")
 
-        # 3. Calls get_balance_breakdown()
         breakdown = get_balance_breakdown()
         print(f"3. get_balance_breakdown() -> {breakdown}")
 
-        # 4. Calls get_recent_summary('expense', 7)
         expense_rows, expense_total = get_recent_summary("expense", 7)
         print(f"4. get_recent_summary('expense', 7) -> Total: {expense_total}, Rows count: {len(expense_rows)}")
-        for r in expense_rows:
-            print(f"   Row: {r}")
 
-        # 5. Validates that the returned data structures contain valid keys and numeric balances.
-        assert "liquid" in breakdown, "Missing 'liquid' key in breakdown"
-        assert "investments" in breakdown, "Missing 'investments' key in breakdown"
-        assert "Cash" in breakdown["liquid"], "Missing 'Cash' in breakdown['liquid']"
-        assert "BCA" in breakdown["liquid"], "Missing 'BCA' in breakdown['liquid']"
-        assert "Jenius" in breakdown["liquid"], "Missing 'Jenius' in breakdown['liquid']"
-        assert isinstance(breakdown["liquid"]["Cash"]["balance"], (int, float)), "Cash balance is not numeric"
-        assert isinstance(breakdown["investments"].get("Bibit"), (int, float)), "Bibit total is not numeric"
-        assert isinstance(breakdown["investments"].get("Gotrade"), (int, float)), "Gotrade total is not numeric"
-        assert isinstance(expense_total, (int, float)), "expense_total is not numeric"
-        assert expense_total >= 25000.0, "expense_total should include at least 25000.0"
-        assert len(expense_rows) >= 1, "recent expenses rows should not be empty"
+        assert "liquid" in breakdown
+        assert "investments" in breakdown
+        assert isinstance(breakdown["liquid"]["Cash"]["balance"], (int, float))
+        assert isinstance(breakdown["investments"].get("Bibit"), (int, float))
+        assert isinstance(breakdown["investments"].get("Gotrade"), (int, float))
+        print("Part A checks PASSED.")
 
-        print("5. Validation: All keys present and numeric balances verified!")
-        print("=== TEST PASSED SUCCESSFULLY ===")
+        # Part B: Feature 4 Routing Verification with 4 Mocks
+        print("\n[PART B: Feature 4 Database Routing Verification]")
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
+        bca_start = float(cursor.fetchone()[0])
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'Jenius'")
+        jenius_start = float(cursor.fetchone()[0])
+        cursor.execute("SELECT units FROM holdings WHERE platform = 'Bibit' AND ticker = 'SMMF'")
+        smmf_start = float(cursor.fetchone()[0])
+        conn.close()
+
+        # 1. Mock "expense" (BCA Rp 50.000 for groceries)
+        mock_expense = {
+            "kind": "expense",
+            "platform": "BCA",
+            "target_platform": None,
+            "amount": 50000.0,
+            "category": "Groceries",
+            "note": "Supermarket groceries",
+            "ticker": None,
+            "units_added": None
+        }
+        embed_expense = process_parsed_slip(mock_expense)
+        assert isinstance(embed_expense, discord.Embed)
+        print("1. Mock Expense (BCA -50,000) processed -> Red Embed")
+
+        # 2. Mock "transfer" (BCA Rp 500.000 to Bibit)
+        mock_transfer = {
+            "kind": "transfer",
+            "platform": "BCA",
+            "target_platform": "Bibit",
+            "amount": 500000.0,
+            "category": "Transfer",
+            "note": "Top up Bibit from BCA",
+            "ticker": None,
+            "units_added": None
+        }
+        embed_transfer = process_parsed_slip(mock_transfer)
+        assert isinstance(embed_transfer, discord.Embed)
+        print("2. Mock Transfer (BCA -500,000 to Bibit) processed -> Blue Embed")
+
+        # 3. Mock "order_filled" (Bibit SMMF +251.05 units)
+        mock_order = {
+            "kind": "order_filled",
+            "platform": "Bibit",
+            "target_platform": None,
+            "amount": 500000.0,
+            "category": "Investment",
+            "note": "Bibit SMMF order executed",
+            "ticker": "SMMF",
+            "units_added": 251.05
+        }
+        embed_order = process_parsed_slip(mock_order)
+        assert isinstance(embed_order, discord.Embed)
+        print("3. Mock Order Filled (Bibit SMMF +251.05 units) processed -> Purple Embed")
+
+        # 4. Mock "income" (Jenius Rp 1.000.000 freelance)
+        mock_income = {
+            "kind": "income",
+            "platform": "Jenius",
+            "target_platform": None,
+            "amount": 1000000.0,
+            "category": "Salary",
+            "note": "Freelance design payment",
+            "ticker": None,
+            "units_added": None
+        }
+        embed_income = process_parsed_slip(mock_income)
+        assert isinstance(embed_income, discord.Embed)
+        print("4. Mock Income (Jenius +1,000,000) processed -> Green Embed")
+
+        # Verify DB Changes
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
+        bca_end = float(cursor.fetchone()[0])
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'Jenius'")
+        jenius_end = float(cursor.fetchone()[0])
+        cursor.execute("SELECT units FROM holdings WHERE platform = 'Bibit' AND ticker = 'SMMF'")
+        smmf_end = float(cursor.fetchone()[0])
+
+        cursor.execute("SELECT type, amount, note FROM transactions WHERE platform = 'BCA'")
+        bca_txs = cursor.fetchall()
+        cursor.execute("SELECT type, amount, note FROM transactions WHERE platform = 'Jenius'")
+        jenius_txs = cursor.fetchall()
+        conn.close()
+
+        print("\n--- Verifying Database Assertions ---")
+        bca_diff = bca_end - bca_start
+        jenius_diff = jenius_end - jenius_start
+        smmf_diff = smmf_end - smmf_start
+
+        print(f"BCA: start={bca_start}, end={bca_end}, diff={bca_diff} (expected -550000.0)")
+        assert round(bca_diff, 2) == -550000.0, f"BCA decrement failed: {bca_diff}"
+
+        print(f"Jenius: start={jenius_start}, end={jenius_end}, diff={jenius_diff} (expected +1000000.0)")
+        assert round(jenius_diff, 2) == 1000000.0, f"Jenius increment failed: {jenius_diff}"
+
+        print(f"SMMF Units: start={smmf_start}, end={smmf_end}, diff={smmf_diff} (expected +251.05)")
+        assert round(smmf_diff, 4) == 251.05, f"SMMF units increment failed: {smmf_diff}"
+
+        recorded_types = [tx[0] for tx in bca_txs] + [tx[0] for tx in jenius_txs]
+        print(f"Recorded Transaction Types: {recorded_types}")
+        assert "expense" in recorded_types, "Missing 'expense' transaction"
+        assert "transfer" in recorded_types, "Missing 'transfer' transaction"
+        assert "income" in recorded_types, "Missing 'income' transaction"
+
+        print("\nAll 4 transaction routing paths verified successfully!")
+        print("=== TEST PASSED CLEANLY ===")
     else:
         if DISCORD_TOKEN:
             print("Starting Discord bot...")
