@@ -1,4 +1,5 @@
 import sqlite3
+import yfinance as yf
 
 DB_NAME = "finance.db"
 
@@ -55,7 +56,7 @@ def init_db(db_name: str = DB_NAME) -> None:
     )
 
     holdings_seed = [
-        ("Bibit", "SMMF", 32789.980, "IDR"),
+        ("Bibit", "SMMF", 3278.998, "IDR"),
         ("Gotrade", "VTI", 0.0902, "USD"),
     ]
     cursor.executemany(
@@ -70,10 +71,42 @@ def init_db(db_name: str = DB_NAME) -> None:
     conn.close()
 
 
+def get_investment_totals(db_name: str = DB_NAME) -> dict:
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute("SELECT platform, ticker, units, currency FROM holdings")
+    rows = cursor.fetchall()
+    conn.close()
+
+    totals = {}
+    for platform, ticker, units, currency in rows:
+        if platform == "Gotrade" or ticker == "VTI":
+            ticker_obj = yf.Ticker("VTI")
+            try:
+                hist = ticker_obj.history(period="1d")
+                if not hist.empty and "Close" in hist:
+                    price = float(hist["Close"].iloc[-1])
+                else:
+                    price = float(ticker_obj.fast_info.last_price)
+            except Exception:
+                price = float(ticker_obj.fast_info.last_price)
+            total_usd = units * price
+            totals[platform] = totals.get(platform, 0.0) + total_usd
+        elif platform == "Bibit" or ticker == "SMMF":
+            smmf_nav = 1991.55
+            total_idr = units * smmf_nav
+            totals[platform] = totals.get(platform, 0.0) + total_idr
+
+    return totals
+
+
 if __name__ == "__main__":
     init_db()
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    cursor.execute("UPDATE holdings SET units = 3278.998 WHERE ticker = 'SMMF'")
+    conn.commit()
 
     print("--- ACCOUNTS ---")
     cursor.execute("SELECT platform, balance, currency, updated_at FROM accounts")
@@ -86,3 +119,12 @@ if __name__ == "__main__":
         print(row)
 
     conn.close()
+
+    print("\n--- INVESTMENT TOTALS ---")
+    totals = get_investment_totals()
+    print(totals)
+    for platform, total in totals.items():
+        if platform == "Gotrade":
+            print(f"{platform} (VTI): ${total:.2f} USD")
+        elif platform == "Bibit":
+            print(f"{platform} (SMMF): Rp {total:,.2f} IDR (~Rp {total / 1_000_000:.2f}M IDR)")
