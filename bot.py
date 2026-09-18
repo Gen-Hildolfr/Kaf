@@ -3,6 +3,7 @@ import sys
 import re
 import json
 import base64
+import asyncio
 import sqlite3
 import traceback
 import requests
@@ -238,7 +239,7 @@ def clean_and_parse_json(text: str) -> dict:
     if start_idx != -1 and end_idx != -1:
         cleaned = cleaned[start_idx : end_idx + 1]
 
-    # Remove any trailing commas before } or ]
+    # Remove trailing commas before } or ]
     cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
     return json.loads(cleaned)
 
@@ -254,7 +255,7 @@ def query_unsloth_chat(prompt: str) -> str:
             {"role": "user", "content": prompt}
         ]
     }
-    response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=60)
+    response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=180)
     response.raise_for_status()
     data = response.json()
     reply = data["choices"][0]["message"]["content"]
@@ -287,11 +288,13 @@ def query_unsloth_vision(image_bytes: bytes) -> dict:
         '  "platform": "BCA" | "Jenius" | "Bibit" | "Gotrade" | "Cash",\n'
         '  "target_platform": "Bibit" | "Gotrade" | "External" | null,\n'
         '  "amount": float or null,\n'
+        '  "fee": float or null,\n'
         '  "category": string,\n'
         '  "note": string,\n'
         '  "ticker": "SMMF" | "VTI" | null,\n'
         '  "units_added": float or null\n'
-        "}"
+        "}\n"
+        "Note for fee: If there is an admin fee or transfer fee (e.g. BIAYA Rp 2,500), put the fee in 'fee' as a float (e.g. 2500.0) and the transfer principal in 'amount' (e.g. 500000.0)."
     )
 
     headers = {"Content-Type": "application/json"}
@@ -312,7 +315,7 @@ def query_unsloth_vision(image_bytes: bytes) -> dict:
         "temperature": 0.1
     }
 
-    response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=60)
+    response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=180)
     response.raise_for_status()
     data = response.json()
     raw_content = data["choices"][0]["message"]["content"].strip()
@@ -328,20 +331,32 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
     target_platform = PLATFORM_MAP.get(target_raw.lower(), target_raw if target_raw else "External")
 
     amount = float(data.get("amount") or 0.0)
+    fee = float(data.get("fee") or 0.0)
     category = str(data.get("category") or "General").strip()
     note = str(data.get("note") or "").strip()[:1000]
     ticker = data.get("ticker")
     units_added = float(data.get("units_added") or 0.0)
 
+    # Fallback fee detection from note string if fee wasn't in explicit field
+    if fee == 0.0 and note:
+        fee_match = re.search(r"(?:BIAYA|FEE|ADMIN)[\s:Rp\.]*([\d\.,]+)", note, re.IGNORECASE)
+        if fee_match:
+            try:
+                fee_clean = fee_match.group(1).replace(".", "").replace(",", ".")
+                fee = float(fee_clean)
+            except Exception:
+                pass
+
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
 
     if kind == "expense":
+        total_deducted = amount + fee
         cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
         row = cursor.fetchone()
         curr_balance = float(row[0]) if row and row[0] is not None else 0.0
         currency = row[1] if row and row[1] else "IDR"
-        new_balance = curr_balance - amount
+        new_balance = curr_balance - total_deducted
         cursor.execute(
             "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
             (new_balance, platform),
@@ -353,6 +368,14 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
             """,
             (platform, amount, category, note),
         )
+        if fee > 0:
+            cursor.execute(
+                """
+                INSERT INTO transactions (platform, type, amount, category, note)
+                VALUES (?, 'expense', ?, 'Fee', ?)
+                """,
+                (platform, fee, f"Admin fee: {note}"),
+            )
         conn.commit()
         conn.close()
 
@@ -362,6 +385,9 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
         )
         embed.add_field(name="Platform", value=platform, inline=True)
         embed.add_field(name="Amount", value=f"{amount:,.2f} {currency}", inline=True)
+        if fee > 0:
+            embed.add_field(name="Admin Fee", value=f"{fee:,.2f} {currency}", inline=True)
+            embed.add_field(name="Total Deducted", value=f"{total_deducted:,.2f} {currency}", inline=True)
         embed.add_field(name="Category", value=category, inline=True)
         embed.add_field(name="Note", value=note if note else "-", inline=False)
         embed.add_field(name="Remaining Balance", value=f"{new_balance:,.2f} {currency}", inline=False)
@@ -399,11 +425,12 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
         return embed
 
     elif kind == "transfer":
+        total_deducted = amount + fee
         cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
         row = cursor.fetchone()
         curr_balance = float(row[0]) if row and row[0] is not None else 0.0
         currency = row[1] if row and row[1] else "IDR"
-        new_balance = curr_balance - amount
+        new_balance = curr_balance - total_deducted
         cursor.execute(
             "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
             (new_balance, platform),
@@ -415,6 +442,14 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
             """,
             (platform, amount, note),
         )
+        if fee > 0:
+            cursor.execute(
+                """
+                INSERT INTO transactions (platform, type, amount, category, note)
+                VALUES (?, 'expense', ?, 'Fee', ?)
+                """,
+                (platform, fee, f"Transfer fee for: {note}"),
+            )
         conn.commit()
         conn.close()
 
@@ -424,7 +459,10 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
         )
         embed.add_field(name="From", value=platform, inline=True)
         embed.add_field(name="To", value=target_platform, inline=True)
-        embed.add_field(name="Amount", value=f"{amount:,.2f} {currency}", inline=True)
+        embed.add_field(name="Transfer Amount", value=f"{amount:,.2f} {currency}", inline=True)
+        if fee > 0:
+            embed.add_field(name="Transfer Fee", value=f"{fee:,.2f} {currency}", inline=True)
+            embed.add_field(name="Total Deducted", value=f"{total_deducted:,.2f} {currency}", inline=True)
         embed.add_field(name="Note", value=note if note else "-", inline=False)
         embed.add_field(name="Remaining Balance", value=f"{new_balance:,.2f} {currency}", inline=False)
         return embed
@@ -492,12 +530,12 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
-    # If message.attachments is EMPTY: purely conversational text chat
+    # If message.attachments is EMPTY: purely conversational text chat (non-blocking in thread pool)
     if not message.attachments:
         if message.content.strip():
             async with message.channel.typing():
                 try:
-                    reply_text = query_unsloth_chat(message.content)
+                    reply_text = await asyncio.to_thread(query_unsloth_chat, message.content)
                     await message.reply(reply_text)
                 except Exception as e:
                     print(f"Chat error: {e}")
@@ -517,7 +555,8 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             try:
                 image_bytes = await first_attachment.read()
-                data = query_unsloth_vision(image_bytes)
+                # Run vision query in background worker thread to keep asyncio event loop & Discord heartbeats responsive
+                data = await asyncio.to_thread(query_unsloth_vision, image_bytes)
                 embed = process_parsed_slip(data)
                 await message.reply(embed=embed)
             except Exception as e:
@@ -532,7 +571,7 @@ async def on_message(message: discord.Message):
         if message.content.strip():
             async with message.channel.typing():
                 try:
-                    reply_text = query_unsloth_chat(message.content)
+                    reply_text = await asyncio.to_thread(query_unsloth_chat, message.content)
                     await message.reply(reply_text)
                 except Exception as e:
                     print(f"Chat error: {e}")
@@ -713,13 +752,14 @@ if __name__ == "__main__":
         assert isinstance(embed_expense, discord.Embed)
         print("1. Mock Expense (BCA -50,000) processed -> Red Embed")
 
-        # 2. Mock "transfer" (BCA Rp 500.000 to Bibit) - Also testing raw NBSP text parsing
+        # 2. Mock "transfer" with 2,500 admin fee (BCA Rp 500.000 to External + Rp 2.500 fee)
         raw_transfer_text_with_nbsp = """{\r
 \xa0 "kind": "transfer",\r
 \xa0 "platform": "BCA",\r
 \xa0 "target_platform": "External",\r
 \xa0 "amount": 500000.0,\r
-\xa0 "category": "transfer",\r
+\xa0 "fee": 2500.0,\r
+\xa0 "category": "Transfer",\r
 \xa0 "note": "m-Transfer BERHASIL to BANK BRI 119801002584539 FIONNA CALYSTA TIKHI, BIAYA Rp 2,500.00, Ref 950312026091623221451299A21D4F5F05D",\r
 \xa0 "ticker": null,\r
 \xa0 "units_added": null\r
@@ -727,7 +767,7 @@ if __name__ == "__main__":
         mock_transfer = clean_and_parse_json(raw_transfer_text_with_nbsp)
         embed_transfer = process_parsed_slip(mock_transfer)
         assert isinstance(embed_transfer, discord.Embed)
-        print("2. Mock Transfer with NBSP (BCA -500,000 to External) parsed & processed -> Blue Embed")
+        print("2. Mock Transfer with NBSP & Fee (BCA -500,000 + 2,500 fee) parsed & processed -> Blue Embed")
 
         # 3. Mock "order_filled" (Bibit SMMF +251.05 units)
         mock_order = {
@@ -769,9 +809,9 @@ if __name__ == "__main__":
         cursor.execute("SELECT units FROM holdings WHERE platform = 'Bibit' AND ticker = 'SMMF'")
         smmf_end = float(cursor.fetchone()[0])
 
-        cursor.execute("SELECT type, amount, note FROM transactions WHERE platform = 'BCA'")
+        cursor.execute("SELECT type, amount, category, note FROM transactions WHERE platform = 'BCA'")
         bca_txs = cursor.fetchall()
-        cursor.execute("SELECT type, amount, note FROM transactions WHERE platform = 'Jenius'")
+        cursor.execute("SELECT type, amount, category, note FROM transactions WHERE platform = 'Jenius'")
         jenius_txs = cursor.fetchall()
         conn.close()
 
@@ -780,8 +820,9 @@ if __name__ == "__main__":
         jenius_diff = jenius_end - jenius_start
         smmf_diff = smmf_end - smmf_start
 
-        print(f"BCA: start={bca_start}, end={bca_end}, diff={bca_diff} (expected -550000.0)")
-        assert round(bca_diff, 2) == -550000.0, f"BCA decrement failed: {bca_diff}"
+        # BCA should decrement by: 50,000 (expense) + 500,000 (transfer) + 2,500 (fee) = 552,500
+        print(f"BCA: start={bca_start}, end={bca_end}, diff={bca_diff} (expected -552500.0)")
+        assert round(bca_diff, 2) == -552500.0, f"BCA decrement failed: {bca_diff}"
 
         print(f"Jenius: start={jenius_start}, end={jenius_end}, diff={jenius_diff} (expected +1000000.0)")
         assert round(jenius_diff, 2) == 1000000.0, f"Jenius increment failed: {jenius_diff}"
@@ -790,12 +831,15 @@ if __name__ == "__main__":
         assert round(smmf_diff, 4) == 251.05, f"SMMF units increment failed: {smmf_diff}"
 
         recorded_types = [tx[0] for tx in bca_txs] + [tx[0] for tx in jenius_txs]
+        recorded_categories = [tx[2] for tx in bca_txs]
         print(f"Recorded Transaction Types: {recorded_types}")
+        print(f"Recorded BCA Categories: {recorded_categories}")
         assert "expense" in recorded_types, "Missing 'expense' transaction"
         assert "transfer" in recorded_types, "Missing 'transfer' transaction"
         assert "income" in recorded_types, "Missing 'income' transaction"
+        assert "Fee" in recorded_categories, "Missing 'Fee' category in BCA transactions"
 
-        print("\nAll 4 transaction routing paths verified successfully!")
+        print("\nAll 4 transaction routing paths and fee logging verified successfully!")
         print("=== TEST PASSED CLEANLY ===")
     else:
         if DISCORD_TOKEN:
