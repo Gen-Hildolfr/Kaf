@@ -219,6 +219,24 @@ def get_recent_summary(tx_type: str, days: int = 7, db_name: str = DB_NAME) -> t
 
 
 # ---------------------------------------------------------
+# Formatting Helpers
+# ---------------------------------------------------------
+def embed_to_text(embed: discord.Embed) -> str:
+    """Converts a discord.Embed into formatted Markdown text for fallback
+
+    when the bot role lacks the 'Embed Links' permission in a channel.
+    """
+    parts = []
+    if embed.title:
+        parts.append(f"**{embed.title}**")
+    if embed.description:
+        parts.append(embed.description)
+    for field in embed.fields:
+        parts.append(f"• **{field.name}**: {field.value}")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------
 # Unsloth AI Integration & Robust Slip Parsing
 # ---------------------------------------------------------
 def clean_and_parse_json(text: str) -> dict:
@@ -540,7 +558,10 @@ async def on_message(message: discord.Message):
                 except Exception as e:
                     print(f"Chat error: {e}")
                     traceback.print_exc()
-                    await message.reply("Sorry, I encountered an error talking to the AI service.")
+                    try:
+                        await message.reply("Sorry, I encountered an error talking to the AI service.")
+                    except Exception:
+                        pass
         return
 
     # If message.attachments has an image: receipt/financial slip extraction
@@ -555,17 +576,36 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             try:
                 image_bytes = await first_attachment.read()
-                # Run vision query in background worker thread to keep asyncio event loop & Discord heartbeats responsive
                 data = await asyncio.to_thread(query_unsloth_vision, image_bytes)
                 embed = process_parsed_slip(data)
-                await message.reply(embed=embed)
             except Exception as e:
-                print(f"Error processing image slip: {e}")
+                print(f"Error extracting or processing receipt slip: {e}")
                 traceback.print_exc()
-                await message.reply(
-                    "❌ Unable to parse this receipt or financial slip. "
-                    "Please ensure the image is clear and contains transaction details."
-                )
+                try:
+                    await message.reply(
+                        "❌ Unable to parse this receipt or financial slip. "
+                        "Please ensure the image is clear and contains transaction details."
+                    )
+                except Exception:
+                    pass
+                return
+
+            # Reply with Embed, gracefully falling back to text if 'Embed Links' permission is missing
+            try:
+                await message.reply(embed=embed)
+            except discord.Forbidden:
+                fallback_text = embed_to_text(embed)
+                try:
+                    await message.reply(
+                        f"{fallback_text}\n\n"
+                        "> ⚠️ **Permission Notice**: The bot role is missing the **Embed Links** permission in this channel. "
+                        "Please grant **Embed Links** to the bot role in your Discord Server Settings to see rich styled cards!"
+                    )
+                except discord.Forbidden:
+                    print(f"Error: Bot lacks permission to send messages in channel {message.channel.id}")
+            except Exception as e:
+                print(f"Error sending embed response: {e}")
+                traceback.print_exc()
     else:
         # Attachment is not an image; fall back to text chat if message text is present
         if message.content.strip():
@@ -576,7 +616,10 @@ async def on_message(message: discord.Message):
                 except Exception as e:
                     print(f"Chat error: {e}")
                     traceback.print_exc()
-                    await message.reply("Sorry, I encountered an error talking to the AI service.")
+                    try:
+                        await message.reply("Sorry, I encountered an error talking to the AI service.")
+                    except Exception:
+                        pass
 
 
 # ---------------------------------------------------------
@@ -624,7 +667,10 @@ async def checkbalance(interaction: discord.Interaction):
     )
     embed.add_field(name="💎 Total Net Worth", value=net_worth_text, inline=False)
 
-    await interaction.followup.send(embed=embed)
+    try:
+        await interaction.followup.send(embed=embed)
+    except discord.Forbidden:
+        await interaction.followup.send(embed_to_text(embed))
 
 
 @bot.tree.command(name="addcash", description="Record cash inflow/income to your physical wallet")
@@ -638,7 +684,10 @@ async def addcash(interaction: discord.Interaction, amount: float, note: str):
     embed.add_field(name="Amount Added", value=f"Rp {amount:,.2f}", inline=True)
     embed.add_field(name="Note", value=note, inline=True)
     embed.add_field(name="Updated Wallet Total", value=f"Rp {new_balance:,.2f}", inline=False)
-    await interaction.response.send_message(embed=embed)
+    try:
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(embed_to_text(embed))
 
 
 @bot.tree.command(name="usecash", description="Record cash outflow/expense from your physical wallet")
@@ -652,7 +701,10 @@ async def usecash(interaction: discord.Interaction, amount: float, note: str):
     embed.add_field(name="Amount Spent", value=f"Rp {amount:,.2f}", inline=True)
     embed.add_field(name="Note", value=note, inline=True)
     embed.add_field(name="Remaining Wallet Balance", value=f"Rp {new_balance:,.2f}", inline=False)
-    await interaction.response.send_message(embed=embed)
+    try:
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(embed_to_text(embed))
 
 
 @bot.tree.command(name="checkexpenses", description="List recent expenses from the last 7 days")
@@ -672,7 +724,10 @@ async def checkexpenses(interaction: discord.Interaction):
         embed.description = "No expenses recorded in the last 7 days."
 
     embed.add_field(name="Total (7 Days)", value=f"Rp {total_amount:,.2f}", inline=False)
-    await interaction.response.send_message(embed=embed)
+    try:
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(embed_to_text(embed))
 
 
 @bot.tree.command(name="checkincome", description="List recent income/inflows from the last 7 days")
@@ -692,13 +747,18 @@ async def checkincome(interaction: discord.Interaction):
         embed.description = "No income recorded in the last 7 days."
 
     embed.add_field(name="Total (7 Days)", value=f"Rp {total_amount:,.2f}", inline=False)
-    await interaction.response.send_message(embed=embed)
+    try:
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(embed_to_text(embed))
 
 
 # ---------------------------------------------------------
 # Main Entry Point & Smoke Test
 # ---------------------------------------------------------
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     init_db()
 
     if "--test" in sys.argv:
@@ -839,7 +899,12 @@ if __name__ == "__main__":
         assert "income" in recorded_types, "Missing 'income' transaction"
         assert "Fee" in recorded_categories, "Missing 'Fee' category in BCA transactions"
 
-        print("\nAll 4 transaction routing paths and fee logging verified successfully!")
+        # Verify fallback text formatting
+        sample_text = embed_to_text(embed_transfer)
+        assert "**🔁 Transfer Recorded**" in sample_text
+        print("\nFallback text format verified:\n" + sample_text)
+
+        print("\nAll 4 transaction routing paths, fee logging, and embed fallbacks verified successfully!")
         print("=== TEST PASSED CLEANLY ===")
     else:
         if DISCORD_TOKEN:
