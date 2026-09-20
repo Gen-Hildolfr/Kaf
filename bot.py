@@ -376,6 +376,10 @@ def get_balance_breakdown(db_name: str = DB_NAME) -> dict:
         "SELECT platform, balance, currency FROM accounts WHERE platform IN ('Cash', 'BCA', 'Jenius')"
     )
     account_rows = cursor.fetchall()
+
+    cursor.execute("SELECT balance FROM accounts WHERE platform = 'Bibit'")
+    bibit_row = cursor.fetchone()
+    bibit_cash = float(bibit_row[0] or 0.0) if bibit_row and bibit_row[0] is not None else 0.0
     conn.close()
 
     liquid = {}
@@ -392,12 +396,13 @@ def get_balance_breakdown(db_name: str = DB_NAME) -> dict:
     total_liquid_idr = sum(
         acc["balance"] for acc in liquid.values() if acc["currency"] == "IDR"
     )
-    total_idr = total_liquid_idr + investments.get("Bibit", 0.0)
+    total_idr = total_liquid_idr + investments.get("Bibit", 0.0) + bibit_cash
     total_usd = investments.get("Gotrade", 0.0)
 
     return {
         "liquid": liquid,
         "investments": investments,
+        "bibit_cash": bibit_cash,
         "total_liquid_idr": total_liquid_idr,
         "total_idr": total_idr,
         "total_usd": total_usd,
@@ -789,6 +794,11 @@ def generate_portfolio_chart(breakdown: dict) -> io.BytesIO:
     if bibit_val > 0:
         labels.append("Bibit (SMMF)")
         values.append(bibit_val)
+
+    bibit_cash = float(breakdown.get("bibit_cash", 0.0))
+    if bibit_cash > 0:
+        labels.append("Bibit (Cash)")
+        values.append(bibit_cash)
 
     gotrade_usd = float(investments.get("Gotrade", 0.0))
     if gotrade_usd > 0:
@@ -1415,7 +1425,7 @@ async def on_message(message: discord.Message):
             try:
                 image_bytes = await first_attachment.read()
                 data = await asyncio.to_thread(query_unsloth_vision, image_bytes)
-                embed = commit_parsed_slip(data)
+                embed = await asyncio.to_thread(commit_parsed_slip, data)
             except Exception as e:
                 logger.error(f"Error extracting or processing receipt slip: {e}", exc_info=True)
                 try:
@@ -1486,15 +1496,19 @@ async def checkbalance(interaction: discord.Interaction):
 
     investments = breakdown["investments"]
     bibit_val = investments.get("Bibit", 0.0)
+    bibit_cash = breakdown.get("bibit_cash", 0.0)
     gotrade_val = investments.get("Gotrade", 0.0)
 
-    investments_text = (
-        f"• **Bibit (SMMF)**: Rp {bibit_val:,.2f} IDR\n"
-        f"• **Gotrade (VTI)**: ${gotrade_val:,.2f} USD"
-    )
+    investments_lines = [
+        f"• **Bibit (SMMF)**: Rp {bibit_val:,.2f} IDR",
+    ]
+    if bibit_cash > 0:
+        investments_lines.append(f"• **Bibit (RDN Cash)**: Rp {bibit_cash:,.2f} IDR")
+    investments_lines.append(f"• **Gotrade (VTI)**: ${gotrade_val:,.2f} USD")
+    investments_text = "\n".join(investments_lines)
     embed.add_field(name="📈 Investments", value=investments_text, inline=False)
 
-    total_idr = breakdown.get("total_idr", total_liquid + bibit_val)
+    total_idr = breakdown.get("total_idr", total_liquid + bibit_val + bibit_cash)
     total_usd = breakdown.get("total_usd", gotrade_val)
     net_worth_text = (
         f"• **Total IDR Assets**: Rp {total_idr:,.2f}\n"
@@ -1647,6 +1661,7 @@ async def chart_portfolio(interaction: discord.Interaction):
     bca_val = liquid.get("BCA", {}).get("balance", 0.0)
     jenius_val = liquid.get("Jenius", {}).get("balance", 0.0)
     bibit_val = investments.get("Bibit", 0.0)
+    bibit_cash = breakdown.get("bibit_cash", 0.0)
     gotrade_val = investments.get("Gotrade", 0.0)
 
     summary_lines = [
@@ -1654,10 +1669,14 @@ async def chart_portfolio(interaction: discord.Interaction):
         f"• BCA: Rp {bca_val:,.2f}",
         f"• Jenius: Rp {jenius_val:,.2f}",
         f"• Bibit (SMMF): Rp {bibit_val:,.2f} IDR",
+    ]
+    if bibit_cash > 0:
+        summary_lines.append(f"• Bibit (RDN Cash): Rp {bibit_cash:,.2f} IDR")
+    summary_lines.extend([
         f"• Gotrade (VTI): ${gotrade_val:,.2f} USD",
         f"• Total IDR Assets: Rp {breakdown.get('total_idr', 0.0):,.2f}",
         f"• Total USD Assets: ${breakdown.get('total_usd', 0.0):,.2f}",
-    ]
+    ])
     summary_text = "\n".join(summary_lines)
     commentary = await get_financial_critique("Portfolio Asset Allocation", summary_text)
 
@@ -1719,7 +1738,7 @@ async def backup(interaction: discord.Interaction):
     logger.info(f"Command /backup executed by {interaction.user}")
     await interaction.response.defer()
     try:
-        backup_path = perform_db_backup(DB_NAME)
+        backup_path = await asyncio.to_thread(perform_db_backup, DB_NAME)
         size_kb = os.path.getsize(backup_path) / 1024.0
         filename = os.path.basename(backup_path)
 
@@ -1856,6 +1875,11 @@ if __name__ == "__main__":
         assert round(bca_diff, 2) == -1000000.0, f"BCA balance decrease mismatch: {bca_diff}"
         assert round(bibit_diff, 2) == 1000000.0, f"Bibit cash balance increase mismatch: {bibit_diff}"
 
+        # Verify uninvested RDN cash is accounted for in breakdown
+        rdn_breakdown = get_balance_breakdown(db_name=TEST_DB)
+        assert rdn_breakdown["bibit_cash"] == 1000000.0, f"Expected bibit_cash 1000000.0, got {rdn_breakdown['bibit_cash']}"
+        print(f"1b. Verified uninvested Bibit RDN cash in breakdown: Rp {rdn_breakdown['bibit_cash']:,.2f}")
+
         # Test 2: Order Filled: Bibit purchase of 251.05 SMMF units for Rp 500.000
         mock_order = {
             "kind": "order_filled",
@@ -1884,6 +1908,10 @@ if __name__ == "__main__":
         print(f"2. Order Filled: SMMF units diff={smmf_diff} (expected +251.05), Bibit cash diff={bibit_order_diff} (expected -500000.0)")
         assert round(smmf_diff, 4) == 251.05, f"SMMF units increase mismatch: {smmf_diff}"
         assert round(bibit_order_diff, 2) == -500000.0, f"Bibit cash decrease mismatch: {bibit_order_diff}"
+
+        post_order_breakdown = get_balance_breakdown(db_name=TEST_DB)
+        assert post_order_breakdown["bibit_cash"] == 500000.0, f"Expected bibit_cash 500000.0, got {post_order_breakdown['bibit_cash']}"
+        print(f"2b. Verified remaining Bibit RDN cash in breakdown: Rp {post_order_breakdown['bibit_cash']:,.2f}")
 
         # Test 3: Command verification: Call get_recent_activity(days=14, db_name=TEST_DB)
         act_rows, act_outflows, act_switched = get_recent_activity(days=14, db_name=TEST_DB)
