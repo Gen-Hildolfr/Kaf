@@ -422,6 +422,242 @@ def get_recent_summary(tx_type: str, days: int = 7, db_name: str = DB_NAME) -> t
     return rows, total_amount
 
 
+def undo_last_transaction(db_name: str = DB_NAME) -> tuple[bool, str]:
+    """Reverts the most recently recorded transaction in `transactions`.
+
+    Reverses ledger effects based on type/category:
+    - Expense: refunds amount (+ any admin fee) back to source account.
+    - Income: deducts amount from source account.
+    - Transfer (Switching / Investment Funding): refunds amount (+ fee) to source platform,
+      and deducts amount from target platform.
+    - Transfer (Outgoing): refunds amount (+ fee) to source platform.
+    - Order / order_filled: reverts units in holdings and refunds amount in accounts.
+
+    Deletes the record(s) from `transactions` and commits changes.
+
+    Returns:
+        tuple[bool, str]: (success, summary_message)
+    """
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT id, platform, type, amount, category, note FROM transactions ORDER BY id DESC LIMIT 1"
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return False, "No transactions found to undo."
+
+    tx_id, platform, tx_type, amount, category, note = row
+    tx_type = (tx_type or "").lower()
+    category = category or ""
+    note = note or ""
+    amount = float(amount or 0.0)
+
+    fee = 0.0
+    ids_to_delete = [tx_id]
+
+    # Check if the latest transaction was an admin/transfer fee
+    if category == "Fee" or note.startswith("Admin fee:") or note.startswith("Transfer fee for:"):
+        fee_id = tx_id
+        fee = amount
+        cursor.execute(
+            """
+            SELECT id, platform, type, amount, category, note
+            FROM transactions
+            WHERE id < ? AND platform = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (fee_id, platform),
+        )
+        parent_row = cursor.fetchone()
+        if parent_row:
+            p_id, platform, tx_type, amount, category, note = parent_row
+            tx_type = (tx_type or "").lower()
+            category = category or ""
+            note = note or ""
+            amount = float(amount or 0.0)
+            ids_to_delete = [p_id, fee_id]
+    else:
+        # Check if preceding or subsequent transaction was an associated fee
+        cursor.execute(
+            """
+            SELECT id, amount FROM transactions
+            WHERE id IN (?, ?) AND category = 'Fee' AND platform = ?
+            """,
+            (tx_id - 1, tx_id + 1, platform),
+        )
+        fee_row = cursor.fetchone()
+        if fee_row:
+            fee_id, fee_amt = fee_row
+            fee = float(fee_amt or 0.0)
+            ids_to_delete.append(fee_id)
+
+    # 1. Revert Expense
+    if tx_type == "expense":
+        refund_amount = amount + fee
+        cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+        acc_row = cursor.fetchone()
+        curr_bal = float(acc_row[0]) if acc_row and acc_row[0] is not None else 0.0
+        currency = acc_row[1] if acc_row and acc_row[1] else "IDR"
+        new_bal = curr_bal + refund_amount
+        cursor.execute(
+            "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+            (new_bal, platform),
+        )
+        fee_text = f" (including Rp {fee:,.2f} fee)" if fee > 0 else ""
+        summary_msg = (
+            f"Reverted expense of Rp {amount:,.2f}{fee_text} on **{platform}**.\n"
+            f"• Restored **{platform}** balance: Rp {new_bal:,.2f} {currency}"
+        )
+
+    # 2. Revert Income
+    elif tx_type == "income":
+        cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+        acc_row = cursor.fetchone()
+        curr_bal = float(acc_row[0]) if acc_row and acc_row[0] is not None else 0.0
+        currency = acc_row[1] if acc_row and acc_row[1] else "IDR"
+        new_bal = curr_bal - amount
+        cursor.execute(
+            "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+            (new_bal, platform),
+        )
+        summary_msg = (
+            f"Reverted income of Rp {amount:,.2f} on **{platform}**.\n"
+            f"• Updated **{platform}** balance: Rp {new_bal:,.2f} {currency}"
+        )
+
+    # 3. Revert Transfer (Switching, Investment Funding, Outgoing)
+    elif tx_type == "transfer":
+        refund_src = amount + fee
+        cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+        src_row = cursor.fetchone()
+        curr_src_bal = float(src_row[0]) if src_row and src_row[0] is not None else 0.0
+        currency = src_row[1] if src_row and src_row[1] else "IDR"
+        new_src_bal = curr_src_bal + refund_src
+        cursor.execute(
+            "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+            (new_src_bal, platform),
+        )
+
+        target_platform = None
+        if category in ("Switching", "Investment Funding"):
+            note_lower = note.lower()
+            if "bibit" in note_lower or (RDN_ACCOUNT_NO and RDN_ACCOUNT_NO in note):
+                target_platform = "Bibit"
+            elif "gotrade" in note_lower or "valbury" in note_lower:
+                target_platform = "Gotrade"
+            elif "jenius" in note_lower or "smbc" in note_lower or "btpn" in note_lower:
+                target_platform = "Jenius"
+            elif "bca" in note_lower and platform != "BCA":
+                target_platform = "BCA"
+            elif "cash" in note_lower and platform != "Cash":
+                target_platform = "Cash"
+            else:
+                for p_name in ["BCA", "Jenius", "Bibit", "Gotrade", "Cash"]:
+                    if p_name.lower() in note_lower and p_name != platform:
+                        target_platform = p_name
+                        break
+
+        new_tgt_bal = None
+        if target_platform:
+            cursor.execute("SELECT balance FROM accounts WHERE platform = ?", (target_platform,))
+            tgt_row = cursor.fetchone()
+            if tgt_row:
+                curr_tgt = float(tgt_row[0]) if tgt_row[0] is not None else 0.0
+                new_tgt_bal = curr_tgt - amount
+                cursor.execute(
+                    "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+                    (new_tgt_bal, target_platform),
+                )
+
+        fee_text = f" (including Rp {fee:,.2f} fee)" if fee > 0 else ""
+        if target_platform and new_tgt_bal is not None:
+            summary_msg = (
+                f"Reverted balance transfer of Rp {amount:,.2f}{fee_text} from **{platform}** to **{target_platform}**.\n"
+                f"• Restored **{platform}** balance: Rp {new_src_bal:,.2f} {currency}\n"
+                f"• Restored **{target_platform}** balance: Rp {new_tgt_bal:,.2f} {currency}"
+            )
+        else:
+            summary_msg = (
+                f"Reverted outgoing transfer of Rp {amount:,.2f}{fee_text} from **{platform}**.\n"
+                f"• Restored **{platform}** balance: Rp {new_src_bal:,.2f} {currency}"
+            )
+
+    # 4. Revert Order / order_filled
+    elif category == "Order" or tx_type == "order_filled":
+        units = None
+        ticker = None
+        m = re.search(r'([\d\.,]+)\s+([A-Za-z0-9]+)\s+units', note, re.IGNORECASE)
+        if m:
+            try:
+                units = float(m.group(1).replace(",", ""))
+                ticker = m.group(2).upper()
+            except Exception:
+                pass
+
+        if not ticker:
+            if platform == "Bibit":
+                ticker = "SMMF"
+            elif platform == "Gotrade":
+                ticker = "VTI"
+
+        reverted_units_msg = ""
+        if ticker and units is not None:
+            cursor.execute(
+                "SELECT units FROM holdings WHERE platform = ? AND ticker = ?",
+                (platform, ticker),
+            )
+            h_row = cursor.fetchone()
+            if h_row:
+                curr_u = float(h_row[0])
+                new_u = max(0.0, curr_u - units)
+                cursor.execute(
+                    "UPDATE holdings SET units = ? WHERE platform = ? AND ticker = ?",
+                    (new_u, platform, ticker),
+                )
+                reverted_units_msg = f"• Reverted **{platform} ({ticker})** holdings: -{units:,.4f} units (now {new_u:,.4f} units)\n"
+
+        refund_msg = ""
+        if amount > 0:
+            cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+            acc_row = cursor.fetchone()
+            if acc_row:
+                curr_bal = float(acc_row[0]) if acc_row[0] is not None else 0.0
+                currency = acc_row[1] if acc_row[1] else "IDR"
+                new_bal = curr_bal + amount
+                cursor.execute(
+                    "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+                    (new_bal, platform),
+                )
+                refund_msg = f"• Refunded cash to **{platform}**: +Rp {amount:,.2f} {currency} (now Rp {new_bal:,.2f} {currency})\n"
+
+        summary_msg = f"Reverted investment order (*{note}*):\n{reverted_units_msg}{refund_msg}".strip()
+
+    else:
+        cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+        acc_row = cursor.fetchone()
+        if acc_row and amount > 0:
+            curr_bal = float(acc_row[0]) if acc_row[0] is not None else 0.0
+            currency = acc_row[1] if acc_row[1] else "IDR"
+            new_bal = curr_bal + amount
+            cursor.execute(
+                "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+                (new_bal, platform),
+            )
+            summary_msg = f"Reverted transaction #{tx_id} (*{note}*): refunded {amount:,.2f} {currency} to **{platform}** (now {new_bal:,.2f} {currency})."
+        else:
+            summary_msg = f"Reverted transaction #{tx_id} (*{note}*)."
+
+    placeholders = ",".join("?" for _ in ids_to_delete)
+    cursor.execute(f"DELETE FROM transactions WHERE id IN ({placeholders})", ids_to_delete)
+    conn.commit()
+    conn.close()
+    return True, summary_msg
+
+
+
 # ---------------------------------------------------------
 # Formatting Helpers
 # ---------------------------------------------------------
@@ -834,6 +1070,14 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
                     (new_account_bal, platform),
                 )
 
+        cursor.execute(
+            """
+            INSERT INTO transactions (platform, type, amount, category, note)
+            VALUES (?, 'order_filled', ?, 'Order', ?)
+            """,
+            (platform, amount if amount else 0.0, note if note else f"Purchase of {units_added} {ticker} units"),
+        )
+
         conn.commit()
         conn.close()
 
@@ -1098,6 +1342,27 @@ async def checkincome(interaction: discord.Interaction):
         await interaction.response.send_message(embed_to_text(embed))
 
 
+@bot.tree.command(name="undo", description="Revert the most recently recorded transaction")
+async def undo(interaction: discord.Interaction):
+    success, message = undo_last_transaction()
+    if success:
+        embed = discord.Embed(
+            title="🔄 Transaction Reverted",
+            description=message,
+            color=discord.Color.green(),
+        )
+    else:
+        embed = discord.Embed(
+            title="⚠️ Undo Failed",
+            description=message,
+            color=discord.Color.red(),
+        )
+    try:
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(embed_to_text(embed))
+
+
 # ---------------------------------------------------------
 # Main Entry Point & Smoke Test
 # ---------------------------------------------------------
@@ -1245,7 +1510,59 @@ if __name__ == "__main__":
         notes = [r[5] for r in act_rows]
         assert f"transfer to BIBIT RDN {USER_NAME}" in notes, "Missing RDN transfer in recent activity!"
 
-        # 5. Clean up test database files
+        # 5. Part C: Feature 6 Undo Verification on TEST_DB
+        print("\n[PART C: Feature 6 Undo Verification (test_finance.db)]")
+        # Clear existing test transactions to assert table becomes completely empty
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM transactions;")
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
+        bca_pre_undo = float(cursor.fetchone()[0])
+        conn.commit()
+        conn.close()
+
+        # 1. Record an expense (Rp 50.000)
+        mock_expense = {
+            "kind": "expense",
+            "platform": "BCA",
+            "target_platform": None,
+            "amount": 50000.0,
+            "fee": None,
+            "category": "Food",
+            "note": "Dinner",
+            "ticker": None,
+            "units_added": None
+        }
+        process_parsed_slip(mock_expense, db_name=TEST_DB)
+
+        # 2. Verify balance decreased
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
+        bca_after_exp = float(cursor.fetchone()[0])
+        conn.close()
+        print(f"1 & 2. Recorded expense Rp 50,000, BCA balance decreased from {bca_pre_undo} to {bca_after_exp}")
+        assert bca_after_exp == bca_pre_undo - 50000.0, f"Expected {bca_pre_undo - 50000.0}, got {bca_after_exp}"
+
+        # 3. Call undo_last_transaction(TEST_DB)
+        success, undo_msg = undo_last_transaction(TEST_DB)
+        print(f"3. undo_last_transaction: {undo_msg}")
+        assert success is True, f"Undo failed: {undo_msg}"
+
+        # 4. Assert balance is restored to original state and transactions table is empty
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
+        bca_restored = float(cursor.fetchone()[0])
+        cursor.execute("SELECT COUNT(*) FROM transactions")
+        tx_count = cursor.fetchone()[0]
+        conn.close()
+        print(f"4. Restored BCA balance: {bca_restored} (pre-expense: {bca_pre_undo}), transactions count: {tx_count}")
+        assert bca_restored == bca_pre_undo, f"Expected {bca_pre_undo}, got {bca_restored}"
+        assert tx_count == 0, f"Expected 0 transactions, got {tx_count}"
+        print("Part C undo verification PASSED cleanly.")
+
+        # 6. Clean up test database files
         for f in [TEST_DB, f"{TEST_DB}-wal", f"{TEST_DB}-shm"]:
             if os.path.exists(f):
                 try:
