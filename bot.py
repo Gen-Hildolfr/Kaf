@@ -64,6 +64,7 @@ BACKUP_DIR = "backups"
 NAV_CACHE_FILE = "nav_cache.json"
 WIB = timezone(timedelta(hours=7))
 SEED_SMMF_NAV = 1991.55
+PASARDANA_AUTH = os.getenv("PASARDANA_AUTH", "")
 
 PERSONA_PATH = os.path.join(os.path.dirname(__file__), "persona.md")
 if os.path.exists(PERSONA_PATH):
@@ -138,8 +139,8 @@ def init_db(db_name: str = DB_NAME) -> None:
     )
 
     holdings_seed = [
-        ("Bibit", "SMMF", 3278.998, "IDR"),
-        ("Gotrade", "VTI", 0.0902, "USD"),
+        ("Bibit", "SMMF", 0.0, "IDR"),
+        ("Gotrade", "VTI", 0.0, "USD"),
     ]
     cursor.executemany(
         """
@@ -269,7 +270,8 @@ def fetch_smmf_nav(force_refresh: bool = False) -> float:
     if nav is None:
         try:
             pasardana_headers = headers.copy()
-            pasardana_headers["Authorization"] = "Basic Ym5pdXNlcjp5ZFdLWFlGTVFHeTVOcHduQmY5bm1mWEM="
+            if PASARDANA_AUTH:
+                pasardana_headers["Authorization"] = PASARDANA_AUTH
             pasardana_api = "https://pasardana.id/api/FundService/GetSnapshot?fundId=2058"
             r = requests.get(pasardana_api, headers=pasardana_headers, timeout=10)
             if r.status_code == 200:
@@ -353,7 +355,10 @@ def get_investment_totals(db_name: str = DB_NAME) -> dict:
                 else:
                     price = float(ticker_obj.fast_info.last_price)
             except Exception:
-                price = float(ticker_obj.fast_info.last_price)
+                try:
+                    price = float(ticker_obj.fast_info.last_price)
+                except Exception:
+                    price = 0.0  # Fallback to prevent command crash
             total_usd = units * price
             totals[platform] = totals.get(platform, 0.0) + total_usd
         elif platform == "Bibit" or ticker == "SMMF":
@@ -948,16 +953,17 @@ def query_unsloth_chat(prompt: str, system_prompt: str = None) -> str:
 
 
 async def get_financial_critique(topic: str, financial_context: str) -> str:
+    master_title = f"Master {USER_NAME}" if USER_NAME else "Master"
     prompt = (
         f"Topic: {topic}\n"
         f"Financial Summary:\n{financial_context}\n\n"
-        f"Deliver your financial assessment and remarks to Master Gen(2 to 3 sentences max):"
+        f"Deliver your financial assessment and remarks to {master_title} (2 to 3 sentences max):"
     )
     try:
         return await asyncio.to_thread(query_unsloth_chat, prompt)
     except Exception as e:
         logger.warning(f"Failed to fetch AI critique from Unsloth: {e}")
-        return "I've compiled the ledger breakdown for your review, Master Gen. Do keep your spending disciplined."
+        return f"I've compiled the ledger breakdown for your review, {master_title}. Do keep your spending disciplined."
 
 
 def query_unsloth_vision(image_bytes: bytes) -> dict:
@@ -1000,7 +1006,7 @@ Classification Rules:
 5. "order_filled": Stock or mutual fund order execution (VTI, SMMF).
 
 Note Formatting:
-- For any transfer or switching, format the note strictly as: "transfer to <bank name> <recipient name>" (e.g. "transfer to BCA {USER_NAME}" or "transfer to BANK BRI FIONNA CALYSTA TIKHI" or "transfer to BIBIT RDN {USER_NAME}").
+- For any transfer or switching, format the note strictly as: "transfer to <bank name> <recipient name>" (e.g. "transfer to BCA {USER_NAME}" or "transfer to BANK BRI RECIPIENT NAME" or "transfer to BIBIT RDN {USER_NAME}").
 
 Fee Rule:
 - Put any admin/transfer fee in "fee" as a float (e.g. 2500.0). If no fee, null or 0.
@@ -1457,7 +1463,7 @@ async def on_message(message: discord.Message):
 async def checkbalance(interaction: discord.Interaction):
     logger.info(f"Command /checkbalance executed by {interaction.user}")
     await interaction.response.defer()
-    breakdown = get_balance_breakdown()
+    breakdown = await asyncio.to_thread(get_balance_breakdown)
 
     embed = discord.Embed(
         title="🏦 Portfolio & Balance Summary",
@@ -1632,8 +1638,8 @@ chart_group = app_commands.Group(name="chart", description="Visual charts and Ka
 async def chart_portfolio(interaction: discord.Interaction):
     logger.info(f"Command /chart portfolio executed by {interaction.user}")
     await interaction.response.defer()
-    breakdown = get_balance_breakdown()
-    buf = generate_portfolio_chart(breakdown)
+    breakdown = await asyncio.to_thread(get_balance_breakdown)
+    buf = await asyncio.to_thread(generate_portfolio_chart, breakdown)
 
     liquid = breakdown.get("liquid", {})
     investments = breakdown.get("investments", {})
@@ -1677,7 +1683,8 @@ async def chart_portfolio(interaction: discord.Interaction):
 async def chart_expenses(interaction: discord.Interaction, days: int = 30):
     logger.info(f"Command /chart expenses executed by {interaction.user}: days={days}")
     await interaction.response.defer()
-    buf, cat_totals = generate_expenses_chart(days=days)
+    result = await asyncio.to_thread(generate_expenses_chart, days=days)
+    buf, cat_totals = result
     if buf is None:
         await interaction.followup.send(f"No expenses recorded in the last {days} days.")
         return
