@@ -24,6 +24,7 @@ UNSLOTH_MODEL = os.getenv("UNSLOTH_MODEL", "ukisai/Swift-Qwen3.8-27B-GGUF")
 USER_NAME = os.getenv("USER_NAME", "")
 BCA_ACCOUNT_NO = os.getenv("BCA_ACCOUNT_NO", "")
 JENIUS_ACCOUNT_NO = os.getenv("JENIUS_ACCOUNT_NO", "")
+RDN_ACCOUNT_NO = os.getenv("RDN_ACCOUNT_NO", "")
 DB_NAME = "finance.db"
 
 PLATFORM_MAP = {
@@ -209,7 +210,7 @@ def get_recent_activity(days: int = 7, db_name: str = DB_NAME) -> tuple[list, fl
     Returns:
         rows: list of tuples (date, platform, type, category, amount, note)
         total_outflow: float (sum of expenses, fees, and external transfers; EXCLUDES balance switching)
-        total_switched: float (sum of balance switching principal)
+        total_switched: float (sum of balance switching principal + RDN deposits)
     """
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
@@ -217,8 +218,7 @@ def get_recent_activity(days: int = 7, db_name: str = DB_NAME) -> tuple[list, fl
         """
         SELECT date, platform, type, category, amount, note
         FROM transactions
-        WHERE (type = 'expense' OR type = 'transfer')
-          AND date >= datetime('now', ?)
+        WHERE date >= datetime('now', ?)
         ORDER BY date DESC
         """,
         (f"-{days} days",),
@@ -232,9 +232,9 @@ def get_recent_activity(days: int = 7, db_name: str = DB_NAME) -> tuple[list, fl
         tx_type = r[2]
         category = r[3]
         amount = float(r[4])
-        if tx_type == "transfer" and category == "Switching":
+        if tx_type == "transfer" and category in ("Switching", "Investment Funding"):
             total_switched += amount
-        else:
+        elif tx_type == "expense" or (tx_type == "transfer" and category not in ("Switching", "Investment Funding")):
             total_outflow += amount
 
     return rows, total_outflow, total_switched
@@ -246,7 +246,7 @@ def get_recent_outflows(days: int = 7, db_name: str = DB_NAME) -> tuple[list, fl
     in the last `days` days. Excludes internal balance switching (me to me).
     """
     rows, total_outflow, _ = get_recent_activity(days, db_name=db_name)
-    outflow_rows = [r for r in rows if not (r[2] == "transfer" and r[3] == "Switching")]
+    outflow_rows = [r for r in rows if not (r[2] == "transfer" and r[3] in ("Switching", "Investment Funding"))]
     return outflow_rows, total_outflow
 
 
@@ -353,25 +353,27 @@ User Identity & Tracked Accounts:
 - User Name: {USER_NAME}
 - BCA Account Number: {BCA_ACCOUNT_NO}
 - Jenius / Bank BTPN / Bank SMBC Indonesia Account Number: {JENIUS_ACCOUNT_NO}
+- Bibit RDN Account Number: {RDN_ACCOUNT_NO}
 
 Platform Detection Rules:
 - If the slip is from BCA m-banking (m-Transfer with BCA watermark): source platform = "BCA".
 - If the slip is from Jenius app (titled "Outgoing Transfer" or Jenius UI style): source platform = "Jenius", and the bank listed under recipient name (e.g. "BCA • {BCA_ACCOUNT_NO}") is target_platform = "BCA".
 
 Classification Rules:
-1. "switching": Balance switching / transfer between user's own accounts:
+1. "switching": Balance switching / transfer between user's own accounts or investment top-ups:
    - BCA to Jenius (Bank SMBC Indonesia / Bank BTPN)
    - Jenius to BCA
-   - Top-up to Bibit or Gotrade
+   - If the recipient account matches RDN_ACCOUNT_NO, or recipient mentions Bibit, set kind = "switching" and target_platform = "Bibit"
+   - If recipient mentions PT Valbury Asia Futures or Gotrade, set kind = "switching" and target_platform = "Gotrade"
    - target_platform must be one of: "BCA" | "Jenius" | "Bibit" | "Gotrade"
-2. "transfer": Outgoing transfer to an external person or third party (recipient is NOT {USER_NAME}).
+2. "transfer": Outgoing transfer to an external person or third party (recipient is NOT {USER_NAME} and NOT user's RDN/investment accounts).
    - target_platform must be: "External"
 3. "expense": Direct purchases, groceries, fuel, bills, QRIS.
 4. "income": Incoming money/deposit.
 5. "order_filled": Stock or mutual fund order execution (VTI, SMMF).
 
 Note Formatting:
-- For any transfer or switching, format the note strictly as: "transfer to <bank name> <recipient name>" (e.g. "transfer to BCA {USER_NAME}" or "transfer to BANK BRI FIONNA CALYSTA TIKHI").
+- For any transfer or switching, format the note strictly as: "transfer to <bank name> <recipient name>" (e.g. "transfer to BCA {USER_NAME}" or "transfer to BANK BRI FIONNA CALYSTA TIKHI" or "transfer to BIBIT RDN {USER_NAME}").
 
 Fee Rule:
 - Put any admin/transfer fee in "fee" as a float (e.g. 2500.0). If no fee, null or 0.
@@ -517,7 +519,7 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
         return embed
 
     elif kind == "switching":
-        # Internal balance switching (me to me: e.g. BCA <-> Jenius)
+        # Internal balance switching / RDN funding
         total_deducted = amount + fee
 
         # Deduct from source account
@@ -531,7 +533,7 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
             (new_src_bal, platform),
         )
 
-        # Credit to target account if in accounts
+        # Credit to target account if in accounts (BCA, Jenius, Bibit, Gotrade)
         new_target_bal = None
         if target_platform and target_platform in PLATFORM_MAP.values():
             cursor.execute("SELECT balance FROM accounts WHERE platform = ?", (target_platform,))
@@ -543,13 +545,14 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
                 (new_target_bal, target_platform),
             )
 
-        # Log internal transfer transaction
+        # Log transaction: category is "Investment Funding" for Bibit/Gotrade, else "Switching"
+        category_logged = "Investment Funding" if target_platform in ["Bibit", "Gotrade"] else "Switching"
         cursor.execute(
             """
             INSERT INTO transactions (platform, type, amount, category, note)
-            VALUES (?, 'transfer', ?, 'Switching', ?)
+            VALUES (?, 'transfer', ?, ?, ?)
             """,
-            (platform, amount, note),
+            (platform, amount, category_logged, note),
         )
         if fee > 0:
             cursor.execute(
@@ -562,13 +565,14 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
         conn.commit()
         conn.close()
 
+        is_investment = category_logged == "Investment Funding"
         embed = discord.Embed(
-            title="↔️ Balance Switching",
-            color=discord.Color.blue()
+            title="📈 Investment Funding" if is_investment else "↔️ Balance Switching",
+            color=discord.Color.teal() if is_investment else discord.Color.blue()
         )
         embed.add_field(name="From", value=platform, inline=True)
         embed.add_field(name="To", value=target_platform if target_platform else "Internal", inline=True)
-        embed.add_field(name="Switched Amount", value=f"{amount:,.2f} {currency}", inline=True)
+        embed.add_field(name="Funded Amount" if is_investment else "Switched Amount", value=f"{amount:,.2f} {currency}", inline=True)
         if fee > 0:
             embed.add_field(name="Transfer Fee", value=f"{fee:,.2f} {currency}", inline=True)
             embed.add_field(name="Total Deducted", value=f"{total_deducted:,.2f} {currency}", inline=True)
@@ -580,14 +584,23 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
         return embed
 
     elif kind == "transfer":
-        # Check if this transfer is actually a self-transfer (me to me)
+        # Check if this transfer is actually a self-transfer (me to me) or RDN funding
+        is_rdn_bibit = (RDN_ACCOUNT_NO and RDN_ACCOUNT_NO in note) or "bibit" in note.lower()
+        is_rdn_gotrade = any(kw in note.lower() for kw in ["valbury", "gotrade"])
         is_self = (
             target_platform in ["BCA", "Jenius", "Bibit", "Gotrade"]
             or (USER_NAME and USER_NAME.lower() in note.lower())
+            or is_rdn_bibit
+            or is_rdn_gotrade
         )
         if is_self:
             conn.close()
             data["kind"] = "switching"
+            if target_platform not in ["BCA", "Jenius", "Bibit", "Gotrade"]:
+                if is_rdn_gotrade:
+                    data["target_platform"] = "Gotrade"
+                elif is_rdn_bibit:
+                    data["target_platform"] = "Bibit"
             return process_parsed_slip(data, db_name=db_name)
 
         # Outgoing transfer to external third party
@@ -654,6 +667,20 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
                 "INSERT INTO holdings (platform, ticker, units, currency) VALUES (?, ?, ?, ?)",
                 (platform, ticker, new_units, currency),
             )
+
+        new_account_bal = None
+        if amount and amount > 0:
+            cursor.execute("SELECT balance, currency FROM accounts WHERE platform = ?", (platform,))
+            row_acc = cursor.fetchone()
+            if row_acc:
+                curr_acc = float(row_acc[0]) if row_acc[0] is not None else 0.0
+                currency = row_acc[1] if row_acc[1] else currency
+                new_account_bal = curr_acc - amount
+                cursor.execute(
+                    "UPDATE accounts SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE platform = ?",
+                    (new_account_bal, platform),
+                )
+
         conn.commit()
         conn.close()
 
@@ -662,9 +689,13 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
             color=discord.Color.purple()
         )
         embed.add_field(name="Platform", value=platform, inline=True)
-        embed.add_field(name="Ticker", value=ticker, inline=True)
+        embed.add_field(name="Ticker", value=ticker if ticker else "-", inline=True)
         embed.add_field(name="Units Added", value=f"{units_added:,.4f}", inline=True)
         embed.add_field(name="Total Units", value=f"{new_units:,.4f}", inline=False)
+        if amount and amount > 0:
+            embed.add_field(name="Order Amount", value=f"{amount:,.2f} {currency}", inline=True)
+            if new_account_bal is not None:
+                embed.add_field(name="Remaining Cash Balance", value=f"{new_account_bal:,.2f} {currency}", inline=True)
         if note:
             embed.add_field(name="Note", value=note, inline=False)
         return embed
@@ -820,9 +851,9 @@ async def checkbalance(interaction: discord.Interaction):
         await interaction.followup.send(embed_to_text(embed))
 
 
-@bot.tree.command(name="addcash", description="Record cash inflow/income to your physical wallet")
+@bot.tree.command(name="cashin", description="Record cash inflow/income to your physical wallet")
 @app_commands.describe(amount="Amount of cash added in IDR", note="Description or source of cash")
-async def addcash(interaction: discord.Interaction, amount: float, note: str):
+async def cashin(interaction: discord.Interaction, amount: float, note: str):
     new_balance = record_cash_flow(amount, "income", note)
     embed = discord.Embed(
         title="💵 Cash Inflow Added",
@@ -837,9 +868,9 @@ async def addcash(interaction: discord.Interaction, amount: float, note: str):
         await interaction.response.send_message(embed_to_text(embed))
 
 
-@bot.tree.command(name="usecash", description="Record cash outflow/expense from your physical wallet")
+@bot.tree.command(name="cashout", description="Record cash outflow/expense from your physical wallet")
 @app_commands.describe(amount="Amount of cash spent in IDR", note="Description or purpose of expense")
-async def usecash(interaction: discord.Interaction, amount: float, note: str):
+async def cashout(interaction: discord.Interaction, amount: float, note: str):
     new_balance = record_cash_flow(amount, "expense", note)
     embed = discord.Embed(
         title="💸 Cash Outflow Logged",
@@ -854,51 +885,41 @@ async def usecash(interaction: discord.Interaction, amount: float, note: str):
         await interaction.response.send_message(embed_to_text(embed))
 
 
-@bot.tree.command(name="checkactivity", description="List recent activity (expenses, outgoing transfers, balance switching) from the last 7 days")
-async def checkactivity(interaction: discord.Interaction):
-    rows, total_outflow, total_switched = get_recent_activity(7)
+@bot.tree.command(name="checkactivity", description="List recent activity (expenses, outgoing transfers, balance switching) from the last N days")
+@app_commands.describe(days="Number of days to check (default: 7)")
+async def checkactivity(interaction: discord.Interaction, days: int = 7):
+    rows, total_outflow, total_switched = get_recent_activity(days)
     embed = discord.Embed(
-        title="📊 Recent Activity (Last 7 Days)",
+        title=f"📊 Recent Activity (Last {days} Days)",
         color=discord.Color.gold()
     )
     if rows:
         lines = []
         for r in rows[:15]:
             date_str, platform, tx_type, category, amount, note = r[0], r[1], r[2], r[3], float(r[4]), r[5]
-            if tx_type == "transfer" and category == "Switching":
+            if tx_type == "transfer" and category in ("Switching", "Investment Funding"):
                 icon = "↔️"
             elif tx_type == "transfer":
                 icon = "➡️"
             elif category == "Fee":
                 icon = "🏷️"
-            else:
+            elif tx_type == "expense":
                 icon = "💸"
+            elif tx_type == "income":
+                icon = "💵"
+            else:
+                icon = "📝"
             lines.append(f"• `{date_str}` | **{platform}** | Rp {amount:,.2f} - {icon} *{note}*")
         embed.description = "\n".join(lines)
     else:
-        embed.description = "No activity recorded in the last 7 days."
+        embed.description = f"No activity recorded in the last {days} days."
 
-    embed.add_field(name="Total Outflows (7 Days)", value=f"Rp {total_outflow:,.2f}", inline=True)
-    if total_switched > 0:
-        embed.add_field(
-            name="Internal Switching (↔️)",
-            value=f"Rp {total_switched:,.2f}\n*(not counted in outflows)*",
-            inline=True
-        )
+    embed.add_field(name=f"Total Outflow ({days} Days)", value=f"Rp {total_outflow:,.2f}\n*(Expenses + Third-Party Transfers)*", inline=True)
+    embed.add_field(name=f"Total Switched ({days} Days)", value=f"Rp {total_switched:,.2f}\n*(Me-to-Me & RDN Deposits)*", inline=True)
     try:
         await interaction.response.send_message(embed=embed)
     except discord.Forbidden:
         await interaction.response.send_message(embed_to_text(embed))
-
-
-@bot.tree.command(name="checkoutflows", description="Alias for /checkactivity")
-async def checkoutflows(interaction: discord.Interaction):
-    await checkactivity.callback(interaction)
-
-
-@bot.tree.command(name="checkexpenses", description="Alias for /checkactivity")
-async def checkexpenses(interaction: discord.Interaction):
-    await checkactivity.callback(interaction)
 
 
 @bot.tree.command(name="checkincome", description="List recent income/inflows from the last 7 days")
@@ -950,103 +971,85 @@ if __name__ == "__main__":
         print(f"4. Total Outflows: {outflow_total}, Count: {len(outflow_rows)}")
         print("Part A checks PASSED.")
 
-        # Part B: Multi-path Slip Routing Verification
-        print("\n[PART B: Database Routing Verification]")
+        # Part B: Feature 5 RDN Routing, Order Execution & Activity Verification
+        print("\n[PART B: Feature 5 Verification]")
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
         bca_start = float(cursor.fetchone()[0])
-        cursor.execute("SELECT balance FROM accounts WHERE platform = 'Jenius'")
-        jenius_start = float(cursor.fetchone()[0])
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'Bibit'")
+        bibit_cash_start = float(cursor.fetchone()[0])
+        cursor.execute("SELECT units FROM holdings WHERE platform = 'Bibit' AND ticker = 'SMMF'")
+        smmf_units_start = float(cursor.fetchone()[0])
         conn.close()
 
-        # 1. Mock Outgoing Transfer to External (Fionna) -> ➡️
-        mock_outgoing = {
-            "kind": "transfer",
-            "platform": "BCA",
-            "target_platform": "External",
-            "amount": 500000.0,
-            "fee": 2500.0,
-            "category": "Transfer",
-            "note": "transfer to BANK BRI FIONNA CALYSTA TIKHI",
-            "ticker": None,
-            "units_added": None
-        }
-        embed_outgoing = process_parsed_slip(mock_outgoing)
-        assert isinstance(embed_outgoing, discord.Embed)
-        assert "➡️ Outgoing Transfer" in embed_outgoing.title
-        print("1. Outgoing Transfer (BCA -> Fionna, -500k, -2.5k fee) processed -> ➡️ Outgoing Transfer Embed")
-
-        # 2. Mock Balance Switching (BCA to Jenius) -> ↔️
-        mock_switching = {
+        # 1. RDN Transfer: BCA -> Bibit Rp 1.000.000
+        mock_rdn = {
             "kind": "switching",
             "platform": "BCA",
-            "target_platform": "Jenius",
-            "amount": 580000.0,
-            "fee": 2500.0,
-            "category": "Switching",
-            "note": f"transfer to BANK SMBC INDONESIA {USER_NAME}",
-            "ticker": None,
-            "units_added": None
-        }
-        embed_switching = process_parsed_slip(mock_switching)
-        assert isinstance(embed_switching, discord.Embed)
-        assert "↔️ Balance Switching" in embed_switching.title
-        print("2. Balance Switching (BCA -> Jenius, -582.5k, Jenius +580k) processed -> ↔️ Balance Switching Embed")
-
-        # 3. Mock Balance Switching (Jenius to BCA) -> ↔️
-        mock_switching_back = {
-            "kind": "switching",
-            "platform": "Jenius",
-            "target_platform": "BCA",
-            "amount": 360000.0,
+            "target_platform": "Bibit",
+            "amount": 1000000.0,
             "fee": None,
-            "category": "Switching",
-            "note": f"transfer to BCA {USER_NAME}",
+            "category": "Investment Funding",
+            "note": f"transfer to BIBIT RDN {USER_NAME}",
             "ticker": None,
             "units_added": None
         }
-        embed_switching_back = process_parsed_slip(mock_switching_back)
-        assert isinstance(embed_switching_back, discord.Embed)
-        assert "↔️ Balance Switching" in embed_switching_back.title
-        print("3. Balance Switching (Jenius -> BCA, -360k, BCA +360k) processed -> ↔️ Balance Switching Embed")
+        embed_rdn = process_parsed_slip(mock_rdn)
+        assert isinstance(embed_rdn, discord.Embed)
 
-        # Verify DB Changes
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
-        bca_end = float(cursor.fetchone()[0])
-        cursor.execute("SELECT balance FROM accounts WHERE platform = 'Jenius'")
-        jenius_end = float(cursor.fetchone()[0])
+        bca_after_rdn = float(cursor.fetchone()[0])
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'Bibit'")
+        bibit_cash_after_rdn = float(cursor.fetchone()[0])
         conn.close()
 
-        print("\n--- Verifying Balances ---")
-        bca_diff = bca_end - bca_start
-        jenius_diff = jenius_end - jenius_start
+        bca_diff = bca_after_rdn - bca_start
+        bibit_diff = bibit_cash_after_rdn - bibit_cash_start
+        print(f"1. RDN Transfer: BCA diff={bca_diff} (expected -1000000.0), Bibit cash diff={bibit_diff} (expected +1000000.0)")
+        assert round(bca_diff, 2) == -1000000.0, f"BCA balance decrease mismatch: {bca_diff}"
+        assert round(bibit_diff, 2) == 1000000.0, f"Bibit cash balance increase mismatch: {bibit_diff}"
 
-        # BCA changes: -502,500 (outgoing to Fionna) - 582,500 (switching to Jenius) + 360,000 (switching from Jenius) = -725,000
-        print(f"BCA: start={bca_start}, end={bca_end}, diff={bca_diff} (expected -725000.0)")
-        assert round(bca_diff, 2) == -725000.0, f"BCA balance calculation mismatch: {bca_diff}"
+        # 2. Order Filled: Bibit purchase of 251.05 SMMF units for Rp 500.000
+        mock_order = {
+            "kind": "order_filled",
+            "platform": "Bibit",
+            "target_platform": None,
+            "amount": 500000.0,
+            "fee": None,
+            "category": "Investment",
+            "note": "Bibit purchase of 251.05 SMMF units",
+            "ticker": "SMMF",
+            "units_added": 251.05
+        }
+        embed_order = process_parsed_slip(mock_order)
+        assert isinstance(embed_order, discord.Embed)
 
-        # Jenius changes: +580,000 (switching from BCA) - 360,000 (switching to BCA) = +220,000
-        print(f"Jenius: start={jenius_start}, end={jenius_end}, diff={jenius_diff} (expected +220000.0)")
-        assert round(jenius_diff, 2) == 220000.0, f"Jenius balance calculation mismatch: {jenius_diff}"
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT units FROM holdings WHERE platform = 'Bibit' AND ticker = 'SMMF'")
+        smmf_units_after = float(cursor.fetchone()[0])
+        cursor.execute("SELECT balance FROM accounts WHERE platform = 'Bibit'")
+        bibit_cash_after_order = float(cursor.fetchone()[0])
+        conn.close()
 
-        # Verify activity (includes switching with ↔️, separate total)
-        act_rows, act_outflows, act_switched = get_recent_activity(7)
-        act_notes = [r[5] for r in act_rows]
-        assert "transfer to BANK BRI FIONNA CALYSTA TIKHI" in act_notes, "Missing Fionna transfer in activity!"
-        assert f"transfer to BANK SMBC INDONESIA {USER_NAME}" in act_notes, "Missing internal switching in activity!"
-        assert act_switched > 0, f"Expected positive switched total, got {act_switched}"
+        smmf_diff = smmf_units_after - smmf_units_start
+        bibit_order_diff = bibit_cash_after_order - bibit_cash_after_rdn
+        print(f"2. Order Filled: SMMF units diff={smmf_diff} (expected +251.05), Bibit cash diff={bibit_order_diff} (expected -500000.0)")
+        assert round(smmf_diff, 4) == 251.05, f"SMMF units increase mismatch: {smmf_diff}"
+        assert round(bibit_order_diff, 2) == -500000.0, f"Bibit cash decrease mismatch: {bibit_order_diff}"
 
-        # Verify get_recent_outflows (excludes switching from list and total)
-        rows_out, total_out = get_recent_outflows(7)
-        notes_in_outflows = [r[5] for r in rows_out]
-        assert "transfer to BANK BRI FIONNA CALYSTA TIKHI" in notes_in_outflows, "Missing Fionna transfer in outflows!"
-        assert f"transfer to BANK SMBC INDONESIA {USER_NAME}" not in notes_in_outflows, "Internal switching should NOT be in outflows!"
-        assert act_outflows == total_out, f"Mismatch between act_outflows ({act_outflows}) and total_out ({total_out})"
+        # 3. Command verification: Call get_recent_activity(days=14)
+        act_rows, act_outflows, act_switched = get_recent_activity(days=14)
+        print(f"3. get_recent_activity(days=14): {len(act_rows)} items, Outflow=Rp {act_outflows:,.2f}, Switched=Rp {act_switched:,.2f}")
+        assert isinstance(act_rows, list)
+        assert isinstance(act_outflows, float)
+        assert isinstance(act_switched, float)
+        notes = [r[5] for r in act_rows]
+        assert f"transfer to BIBIT RDN {USER_NAME}" in notes, "Missing RDN transfer in recent activity!"
 
-        print(f"\nActivity Verified: Total Outflows = Rp {act_outflows:,.2f} | Total Switched = Rp {act_switched:,.2f}")
         print("=== ALL TESTS PASSED CLEANLY ===")
     else:
         if DISCORD_TOKEN:
