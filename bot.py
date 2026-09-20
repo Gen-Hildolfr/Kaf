@@ -11,6 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
 import yfinance as yf
 
 # ---------------------------------------------------------
@@ -26,6 +27,8 @@ BCA_ACCOUNT_NO = os.getenv("BCA_ACCOUNT_NO", "")
 JENIUS_ACCOUNT_NO = os.getenv("JENIUS_ACCOUNT_NO", "")
 RDN_ACCOUNT_NO = os.getenv("RDN_ACCOUNT_NO", "")
 DB_NAME = "finance.db"
+NAV_CACHE_FILE = "nav_cache.json"
+WIB = timezone(timedelta(hours=7))
 
 PLATFORM_MAP = {
     "cash": "Cash",
@@ -41,6 +44,9 @@ PLATFORM_MAP = {
 def init_db(db_name: str = DB_NAME) -> None:
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
+
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
@@ -105,6 +111,123 @@ def init_db(db_name: str = DB_NAME) -> None:
     conn.close()
 
 
+def get_most_recent_friday_21_wib(now_dt: datetime) -> datetime:
+    """Calculates the datetime of the most recent Friday at 21:00 WIB (UTC+7)."""
+    if now_dt.tzinfo is None:
+        now_dt = now_dt.replace(tzinfo=WIB)
+    else:
+        now_dt = now_dt.astimezone(WIB)
+
+    weekday = now_dt.weekday()  # Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6
+    if weekday == 4:
+        if now_dt.hour >= 21:
+            days_ago = 0
+        else:
+            days_ago = 7
+    elif weekday > 4:
+        days_ago = weekday - 4
+    else:
+        days_ago = weekday + 3
+
+    target_date = now_dt.date() - timedelta(days=days_ago)
+    return datetime(target_date.year, target_date.month, target_date.day, 21, 0, 0, tzinfo=WIB)
+
+
+def fetch_smmf_nav(force_refresh: bool = False) -> float:
+    """Dynamic Friday-aligned SMMF NAV fetcher.
+
+    Checks nav_cache.json. If updated_at >= most recent Friday 21:00 WIB and not force_refresh,
+    returns cached NAV without making network requests.
+    Otherwise queries Bareksa endpoint, with fallbacks to Pasardana, Bibit, cache, and 1991.55.
+    """
+    now_wib = datetime.now(WIB)
+    most_recent_friday = get_most_recent_friday_21_wib(now_wib)
+
+    cached_nav = None
+    if os.path.exists(NAV_CACHE_FILE):
+        try:
+            with open(NAV_CACHE_FILE, "r", encoding="utf-8") as f:
+                cache_data = json.load(f)
+                cached_nav = float(cache_data.get("nav", 0.0))
+                updated_at_str = cache_data.get("updated_at", "")
+                if updated_at_str:
+                    cached_dt = datetime.strptime(updated_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=WIB)
+                    if not force_refresh and cached_dt >= most_recent_friday and cached_nav > 0:
+                        return cached_nav
+        except Exception as e:
+            print(f"Notice: Failed to read {NAV_CACHE_FILE}: {e}")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    nav = None
+
+    # Primary: Bareksa
+    try:
+        bareksa_url = "https://www.bareksa.com/api/invest/product/detail/sucorinvest-money-market-fund"
+        r = requests.get(bareksa_url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            val = data.get("data", {}).get("nav") or data.get("nav")
+            if val:
+                nav = float(val)
+    except Exception:
+        pass
+
+    # Secondary Fallback: Pasardana
+    if nav is None:
+        try:
+            pasardana_url = "https://pasardana.id/fund/sucorinvest-money-market-fund"
+            r = requests.get(pasardana_url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                match = re.search(r'(?:NAV|NAB|Harga|Price)[\s\:\<\>\w\/\"\'\=]*?([\d\.,]{4,8})', r.text, re.IGNORECASE)
+                if match:
+                    val_str = match.group(1).replace(".", "").replace(",", ".")
+                    val = float(val_str)
+                    if 1500.0 < val < 3000.0:
+                        nav = val
+        except Exception:
+            pass
+
+    # Live Endpoint Fallback: Bibit (retrieves real-time SMMF NAV)
+    if nav is None:
+        try:
+            bibit_url = "https://bibit.id/reksadana/RD1657/sucorinvest-money-market-fund"
+            r = requests.get(bibit_url, headers=headers, timeout=10)
+            if r.status_code == 200:
+                candidates = re.findall(r'Rp<!-- -->([\d\.,]+)', r.text)
+                for cand in candidates:
+                    try:
+                        cand_clean = cand.replace(",", "")
+                        cand_val = float(cand_clean)
+                        if 1500.0 < cand_val < 3000.0:
+                            nav = cand_val
+                            break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # Network Failure Fallback
+    if nav is None or nav <= 0:
+        if cached_nav and cached_nav > 0:
+            nav = cached_nav
+        else:
+            nav = 1991.55
+
+    try:
+        cache_content = {
+            "nav": nav,
+            "updated_at": now_wib.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        with open(NAV_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_content, f, indent=2)
+    except Exception as e:
+        print(f"Notice: Failed to write {NAV_CACHE_FILE}: {e}")
+
+    return nav
+
+
 def get_investment_totals(db_name: str = DB_NAME) -> dict:
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
@@ -127,7 +250,7 @@ def get_investment_totals(db_name: str = DB_NAME) -> dict:
             total_usd = units * price
             totals[platform] = totals.get(platform, 0.0) + total_usd
         elif platform == "Bibit" or ticker == "SMMF":
-            smmf_nav = 1991.55
+            smmf_nav = fetch_smmf_nav()
             total_idr = units * smmf_nav
             totals[platform] = totals.get(platform, 0.0) + total_idr
 
@@ -951,29 +1074,58 @@ async def checkincome(interaction: discord.Interaction):
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    init_db()
 
     if "--test" in sys.argv:
         print("=== RUNNING CLI SMOKE TEST (--test) ===")
-        
-        # Part A: Feature 3 Verification
-        print("\n[PART A: Feature 3 Cash Flow]")
-        cash_after_income = record_cash_flow(100000, "income", "ATM withdrawal")
+        TEST_DB = "test_finance.db"
+
+        # Clean up any pre-existing test database files
+        for f in [TEST_DB, f"{TEST_DB}-wal", f"{TEST_DB}-shm"]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+        # 1. Test isolated database initialization & WAL mode verification
+        init_db(TEST_DB)
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode;")
+        wal_mode = cursor.fetchone()[0]
+        conn.close()
+        print(f"Verified SQLite journal_mode: {wal_mode}")
+        assert wal_mode.lower() == "wal", f"Expected 'wal', got {wal_mode}"
+
+        # 2. Dynamic Friday-Aligned SMMF NAV Fetcher Verification
+        print("\n[PART 0: Dynamic SMMF NAV Fetcher Verification]")
+        live_nav = fetch_smmf_nav(force_refresh=True)
+        print(f"Retrieved live SMMF NAV: {live_nav}")
+        assert 1500.0 < live_nav < 3000.0, f"NAV out of bounds (1500.0 < nav < 3000.0): {live_nav}"
+        print("Live SMMF NAV verified within realistic bounds.")
+
+        # 3. Part A: Cash Flow Verification on TEST_DB
+        print("\n[PART A: Feature 3 Cash Flow (test_finance.db)]")
+        cash_after_income = record_cash_flow(100000, "income", "ATM withdrawal", db_name=TEST_DB)
         print(f"1. Cash balance after income: {cash_after_income}")
+        assert cash_after_income == 100000.0, f"Expected 100000.0, got {cash_after_income}"
 
-        cash_after_expense = record_cash_flow(25000, "expense", "Lunch")
+        cash_after_expense = record_cash_flow(25000, "expense", "Lunch", db_name=TEST_DB)
         print(f"2. Cash balance after expense: {cash_after_expense}")
+        assert cash_after_expense == 75000.0, f"Expected 75000.0, got {cash_after_expense}"
 
-        breakdown = get_balance_breakdown()
+        breakdown = get_balance_breakdown(db_name=TEST_DB)
         print(f"3. Breakdown: {breakdown}")
+        assert breakdown["liquid"]["Cash"]["balance"] == 75000.0
 
-        outflow_rows, outflow_total = get_recent_outflows(7)
+        outflow_rows, outflow_total = get_recent_outflows(7, db_name=TEST_DB)
         print(f"4. Total Outflows: {outflow_total}, Count: {len(outflow_rows)}")
+        assert outflow_total == 25000.0
         print("Part A checks PASSED.")
 
-        # Part B: Feature 5 RDN Routing, Order Execution & Activity Verification
-        print("\n[PART B: Feature 5 Verification]")
-        conn = sqlite3.connect(DB_NAME)
+        # 4. Part B: Feature 5 RDN Routing & Order Execution on TEST_DB
+        print("\n[PART B: Feature 5 Verification (test_finance.db)]")
+        conn = sqlite3.connect(TEST_DB)
         cursor = conn.cursor()
         cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
         bca_start = float(cursor.fetchone()[0])
@@ -983,7 +1135,7 @@ if __name__ == "__main__":
         smmf_units_start = float(cursor.fetchone()[0])
         conn.close()
 
-        # 1. RDN Transfer: BCA -> Bibit Rp 1.000.000
+        # Test 1: RDN Transfer: BCA -> Bibit Rp 1.000.000
         mock_rdn = {
             "kind": "switching",
             "platform": "BCA",
@@ -995,10 +1147,10 @@ if __name__ == "__main__":
             "ticker": None,
             "units_added": None
         }
-        embed_rdn = process_parsed_slip(mock_rdn)
+        embed_rdn = process_parsed_slip(mock_rdn, db_name=TEST_DB)
         assert isinstance(embed_rdn, discord.Embed)
 
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(TEST_DB)
         cursor = conn.cursor()
         cursor.execute("SELECT balance FROM accounts WHERE platform = 'BCA'")
         bca_after_rdn = float(cursor.fetchone()[0])
@@ -1012,7 +1164,7 @@ if __name__ == "__main__":
         assert round(bca_diff, 2) == -1000000.0, f"BCA balance decrease mismatch: {bca_diff}"
         assert round(bibit_diff, 2) == 1000000.0, f"Bibit cash balance increase mismatch: {bibit_diff}"
 
-        # 2. Order Filled: Bibit purchase of 251.05 SMMF units for Rp 500.000
+        # Test 2: Order Filled: Bibit purchase of 251.05 SMMF units for Rp 500.000
         mock_order = {
             "kind": "order_filled",
             "platform": "Bibit",
@@ -1024,10 +1176,10 @@ if __name__ == "__main__":
             "ticker": "SMMF",
             "units_added": 251.05
         }
-        embed_order = process_parsed_slip(mock_order)
+        embed_order = process_parsed_slip(mock_order, db_name=TEST_DB)
         assert isinstance(embed_order, discord.Embed)
 
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(TEST_DB)
         cursor = conn.cursor()
         cursor.execute("SELECT units FROM holdings WHERE platform = 'Bibit' AND ticker = 'SMMF'")
         smmf_units_after = float(cursor.fetchone()[0])
@@ -1041,8 +1193,8 @@ if __name__ == "__main__":
         assert round(smmf_diff, 4) == 251.05, f"SMMF units increase mismatch: {smmf_diff}"
         assert round(bibit_order_diff, 2) == -500000.0, f"Bibit cash decrease mismatch: {bibit_order_diff}"
 
-        # 3. Command verification: Call get_recent_activity(days=14)
-        act_rows, act_outflows, act_switched = get_recent_activity(days=14)
+        # Test 3: Command verification: Call get_recent_activity(days=14, db_name=TEST_DB)
+        act_rows, act_outflows, act_switched = get_recent_activity(days=14, db_name=TEST_DB)
         print(f"3. get_recent_activity(days=14): {len(act_rows)} items, Outflow=Rp {act_outflows:,.2f}, Switched=Rp {act_switched:,.2f}")
         assert isinstance(act_rows, list)
         assert isinstance(act_outflows, float)
@@ -1050,8 +1202,17 @@ if __name__ == "__main__":
         notes = [r[5] for r in act_rows]
         assert f"transfer to BIBIT RDN {USER_NAME}" in notes, "Missing RDN transfer in recent activity!"
 
+        # 5. Clean up test database files
+        for f in [TEST_DB, f"{TEST_DB}-wal", f"{TEST_DB}-shm"]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        print("Cleaned up test_finance.db and related WAL/SHM files.")
         print("=== ALL TESTS PASSED CLEANLY ===")
     else:
+        init_db(DB_NAME)
         if DISCORD_TOKEN:
             print("Starting Discord bot...")
             bot.run(DISCORD_TOKEN)

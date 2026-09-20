@@ -1,4 +1,7 @@
 .env
-finance.db
+*.db
+*.db-wal
+*.db-shm
+nav_cache.json
 __pycache__/
 *.pyc
