@@ -1,4 +1,5 @@
-# Kaf (カフ) — Autonomous Local-First Personal Finance Bot
+# Kaf (カフ)
+# Autonomous Local-First Personal Finance Bot
 
 > *"Allow me to handle your finances, Master. Rest assured, every single cent is meticulously accounted for."*
 
@@ -174,7 +175,7 @@ flowchart LR
 Kaf includes an isolated test runner that validates all core features against a temporary database (`test_finance.db`) without touching your real ledger:
 
 ```bash
-python bot.py --test
+python kaf.py --test
 ```
 
 The test suite validates:
@@ -193,7 +194,7 @@ The test suite validates:
 To start Kaf in production:
 
 ```bash
-python bot.py
+python kaf.py
 ```
 
 All operational logs will stream to `stdout` and automatically rotate into `bot.log` (up to 5MB per file with 3 historical archives).
