@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 import re
@@ -13,6 +14,9 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 import yfinance as yf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # ---------------------------------------------------------
 # Configuration & Constants
@@ -30,6 +34,13 @@ DB_NAME = "finance.db"
 NAV_CACHE_FILE = "nav_cache.json"
 WIB = timezone(timedelta(hours=7))
 SEED_SMMF_NAV = 1991.55
+
+PERSONA_PATH = os.path.join(os.path.dirname(__file__), "persona.md")
+if os.path.exists(PERSONA_PATH):
+    with open(PERSONA_PATH, "r", encoding="utf-8") as f:
+        SYSTEM_PERSONA = f.read().strip()
+else:
+    SYSTEM_PERSONA = "You are Kaf, a meticulous, supportive, and slightly teasing maid managing personal finances."
 
 PLATFORM_MAP = {
     "cash": "Cash",
@@ -677,6 +688,151 @@ def embed_to_text(embed: discord.Embed) -> str:
 
 
 # ---------------------------------------------------------
+# Chart Rendering Helpers (Headless Matplotlib)
+# ---------------------------------------------------------
+def generate_portfolio_chart(breakdown: dict) -> io.BytesIO:
+    """Renders a dark-themed Donut Chart showing portfolio asset allocation.
+
+    Calculates values in IDR for Cash, BCA, Jenius, Bibit (SMMF), and Gotrade (VTI at 16,000 IDR/USD).
+    Filters out accounts with 0 balance.
+    """
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(6, 6), facecolor="#1e1f22")
+    ax.set_facecolor("#1e1f22")
+
+    liquid = breakdown.get("liquid", {})
+    investments = breakdown.get("investments", {})
+
+    labels = []
+    values = []
+
+    # Liquid accounts
+    for acc in ["Cash", "BCA", "Jenius"]:
+        bal = float(liquid.get(acc, {}).get("balance", 0.0))
+        if bal > 0:
+            labels.append(acc)
+            values.append(bal)
+
+    # Investments
+    bibit_val = float(investments.get("Bibit", 0.0))
+    if bibit_val > 0:
+        labels.append("Bibit (SMMF)")
+        values.append(bibit_val)
+
+    gotrade_usd = float(investments.get("Gotrade", 0.0))
+    if gotrade_usd > 0:
+        gotrade_idr = gotrade_usd * 16000.0  # proportional slice visualization
+        labels.append("Gotrade (VTI)")
+        values.append(gotrade_idr)
+
+    if not values or sum(values) <= 0:
+        labels = ["No Assets"]
+        values = [1.0]
+
+    colors = ["#4ade80", "#60a5fa", "#a78bfa", "#f472b6", "#fb923c", "#38bdf8"]
+    if len(labels) > len(colors):
+        colors = colors * ((len(labels) // len(colors)) + 1)
+    slice_colors = colors[:len(labels)]
+
+    wedges, texts, autotexts = ax.pie(
+        values,
+        labels=labels,
+        autopct="%1.1f%%" if sum(values) > 0 and labels != ["No Assets"] else "",
+        pctdistance=0.75,
+        startangle=140,
+        colors=slice_colors,
+        wedgeprops=dict(width=0.4, edgecolor="#1e1f22", linewidth=2),
+        textprops=dict(color="#f3f4f6", fontsize=10, weight="bold"),
+    )
+
+    for at in autotexts:
+        at.set_color("#ffffff")
+        at.set_fontsize(9)
+
+    ax.set_title("Portfolio Asset Allocation", color="#f3f4f6", fontsize=14, weight="bold", pad=20)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", dpi=150, facecolor=fig.get_facecolor(), transparent=False)
+    buf.seek(0)
+    plt.close("all")
+    return buf
+
+
+def generate_expenses_chart(days: int = 30, db_name: str = DB_NAME) -> tuple[io.BytesIO | None, dict]:
+    """Queries expenses from transactions and renders a horizontal bar chart.
+
+    Groups by category and sums amounts descending.
+    Returns (buf, category_totals_dict). If no expenses found, returns (None, {}).
+    """
+    conn = sqlite3.connect(db_name)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT category, SUM(amount) as total
+        FROM transactions
+        WHERE type = 'expense' AND category != 'Fee' AND date >= datetime('now', ?)
+        GROUP BY category
+        ORDER BY total DESC
+        """,
+        (f"-{days} days",),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return None, {}
+
+    cat_totals = {r[0]: float(r[1]) for r in rows}
+
+    categories = list(cat_totals.keys())
+    amounts = list(cat_totals.values())
+
+    categories.reverse()
+    amounts.reverse()
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(8, max(4, len(categories) * 0.6 + 1.5)), facecolor="#1e1f22")
+    ax.set_facecolor("#1e1f22")
+
+    bars = ax.barh(categories, amounts, color="#f87171", edgecolor="#1e1f22", height=0.55)
+
+    max_amount = max(amounts) if amounts else 1.0
+    ax.set_xlim(0, max_amount * 1.25)
+
+    for bar in bars:
+        width = bar.get_width()
+        ax.text(
+            width + (max_amount * 0.02),
+            bar.get_y() + bar.get_height() / 2,
+            f"Rp {width:,.0f}",
+            va="center",
+            ha="left",
+            color="#f3f4f6",
+            fontsize=9,
+            weight="bold",
+        )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#4b5563")
+    ax.spines["bottom"].set_color("#4b5563")
+    ax.tick_params(colors="#9ca3af", labelsize=9)
+    ax.xaxis.grid(True, linestyle="--", alpha=0.3, color="#4b5563")
+    ax.set_axisbelow(True)
+
+    ax.set_title(f"Expenses Breakdown (Last {days} Days)", color="#f3f4f6", fontsize=13, weight="bold", pad=15)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", dpi=150, facecolor=fig.get_facecolor(), transparent=False)
+    buf.seek(0)
+    plt.close("all")
+
+    return buf, cat_totals
+
+
+# ---------------------------------------------------------
 # Unsloth AI Integration & Robust Slip Parsing
 # ---------------------------------------------------------
 def clean_and_parse_json(text: str) -> dict:
@@ -702,16 +858,18 @@ def clean_and_parse_json(text: str) -> dict:
     return json.loads(cleaned)
 
 
-def query_unsloth_chat(prompt: str) -> str:
+def query_unsloth_chat(prompt: str, system_prompt: str = None) -> str:
     headers = {"Content-Type": "application/json"}
     if UNSLOTH_API_KEY:
         headers["Authorization"] = f"Bearer {UNSLOTH_API_KEY}"
 
+    sys_content = system_prompt or SYSTEM_PERSONA
     payload = {
         "model": UNSLOTH_MODEL,
         "messages": [
-            {"role": "user", "content": prompt}
-        ]
+            {"role": "system", "content": sys_content},
+            {"role": "user", "content": prompt},
+        ],
     }
     response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=180)
     response.raise_for_status()
@@ -720,6 +878,19 @@ def query_unsloth_chat(prompt: str) -> str:
     if "<think>" in reply and "</think>" in reply:
         reply = reply.split("</think>", 1)[1].strip()
     return reply
+
+
+async def get_financial_critique(topic: str, financial_context: str) -> str:
+    prompt = (
+        f"Topic: {topic}\n"
+        f"Financial Summary:\n{financial_context}\n\n"
+        f"Deliver your financial assessment and remarks to Master Gen(2 to 3 sentences max):"
+    )
+    try:
+        return await asyncio.to_thread(query_unsloth_chat, prompt)
+    except Exception as e:
+        print(f"Notice: Failed to fetch AI critique from Unsloth: {e}")
+        return "I've compiled the ledger breakdown for your review, Master Gen. Do keep your spending disciplined."
 
 
 def query_unsloth_vision(image_bytes: bytes) -> dict:
@@ -1364,6 +1535,89 @@ async def undo(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------
+# Slash Command Group (/chart)
+# ---------------------------------------------------------
+chart_group = app_commands.Group(name="chart", description="Visual charts and Kaf's financial remarks")
+
+
+@chart_group.command(name="portfolio", description="View dark-themed donut chart of asset allocation with Kaf's commentary")
+async def chart_portfolio(interaction: discord.Interaction):
+    await interaction.response.defer()
+    breakdown = get_balance_breakdown()
+    buf = generate_portfolio_chart(breakdown)
+
+    liquid = breakdown.get("liquid", {})
+    investments = breakdown.get("investments", {})
+    cash_val = liquid.get("Cash", {}).get("balance", 0.0)
+    bca_val = liquid.get("BCA", {}).get("balance", 0.0)
+    jenius_val = liquid.get("Jenius", {}).get("balance", 0.0)
+    bibit_val = investments.get("Bibit", 0.0)
+    gotrade_val = investments.get("Gotrade", 0.0)
+
+    summary_lines = [
+        f"• Cash: Rp {cash_val:,.2f}",
+        f"• BCA: Rp {bca_val:,.2f}",
+        f"• Jenius: Rp {jenius_val:,.2f}",
+        f"• Bibit (SMMF): Rp {bibit_val:,.2f} IDR",
+        f"• Gotrade (VTI): ${gotrade_val:,.2f} USD",
+        f"• Total IDR Assets: Rp {breakdown.get('total_idr', 0.0):,.2f}",
+        f"• Total USD Assets: ${breakdown.get('total_usd', 0.0):,.2f}",
+    ]
+    summary_text = "\n".join(summary_lines)
+    commentary = await get_financial_critique("Portfolio Asset Allocation", summary_text)
+
+    embed = discord.Embed(
+        title="📊 Portfolio Allocation",
+        description=commentary,
+        color=discord.Color(0x2B2D31),
+    )
+    chart_file = discord.File(buf, filename="chart.png")
+    embed.set_image(url="attachment://chart.png")
+    try:
+        await interaction.followup.send(embed=embed, file=chart_file)
+    except discord.Forbidden:
+        chart_file.seek(0)
+        await interaction.followup.send(
+            content=f"📊 **Portfolio Allocation**\n\n{commentary}",
+            file=chart_file,
+        )
+
+
+@chart_group.command(name="expenses", description="View horizontal bar chart of recent expenses with Kaf's commentary")
+@app_commands.describe(days="Number of days to analyze (default: 30)")
+async def chart_expenses(interaction: discord.Interaction, days: int = 30):
+    await interaction.response.defer()
+    buf, cat_totals = generate_expenses_chart(days=days)
+    if buf is None:
+        await interaction.followup.send(f"No expenses recorded in the last {days} days.")
+        return
+
+    total_spent = sum(cat_totals.values())
+    cat_summary = "\n".join([f"• {cat}: Rp {amt:,.2f}" for cat, amt in cat_totals.items()])
+    summary_text = f"Total Outflow: Rp {total_spent:,.2f}\nCategories:\n{cat_summary}"
+    commentary = await get_financial_critique("Recent Spending Breakdown", summary_text)
+
+    embed = discord.Embed(
+        title=f"💸 Spending Breakdown (Last {days} Days)",
+        description=commentary,
+        color=discord.Color(0x2B2D31),
+    )
+    chart_file = discord.File(buf, filename="chart.png")
+    embed.set_image(url="attachment://chart.png")
+    try:
+        await interaction.followup.send(embed=embed, file=chart_file)
+    except discord.Forbidden:
+        chart_file.seek(0)
+        await interaction.followup.send(
+            content=f"💸 **Spending Breakdown (Last {days} Days)**\n\n{commentary}",
+            file=chart_file,
+        )
+
+
+bot.tree.add_command(chart_group)
+
+
+# ---------------------------------------------------------
 # Main Entry Point & Smoke Test
 # ---------------------------------------------------------
 if __name__ == "__main__":
@@ -1562,7 +1816,72 @@ if __name__ == "__main__":
         assert tx_count == 0, f"Expected 0 transactions, got {tx_count}"
         print("Part C undo verification PASSED cleanly.")
 
-        # 6. Clean up test database files
+        # 6. Part D: Feature 7 Persona & Matplotlib Chart Verification
+        print("\n[PART D: Feature 7 Persona & Chart Generation Verification]")
+        # 1. Verify SYSTEM_PERSONA loaded from persona.md
+        print(f"1. Verified SYSTEM_PERSONA length: {len(SYSTEM_PERSONA)} chars")
+        assert len(SYSTEM_PERSONA) > 50, "SYSTEM_PERSONA appears empty or unpopulated!"
+        if os.path.exists(PERSONA_PATH):
+            with open(PERSONA_PATH, "r", encoding="utf-8") as f:
+                expected_persona = f.read().strip()
+            assert SYSTEM_PERSONA == expected_persona, "SYSTEM_PERSONA does not match persona.md content!"
+            print("Loaded SYSTEM_PERSONA matches persona.md content.")
+
+        # 2. Seed sample transactions in test_finance.db: Food (300,000), Utilities (150,000), Impulse (500,000)
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        sample_expenses = [
+            ("BCA", "expense", 300000.0, "Food", "Dinner with friends"),
+            ("Jenius", "expense", 150000.0, "Utilities", "Electricity bill"),
+            ("Cash", "expense", 500000.0, "Impulse", "Gaming keyboard"),
+        ]
+        cursor.executemany(
+            "INSERT INTO transactions (platform, type, amount, category, note) VALUES (?, ?, ?, ?, ?)",
+            sample_expenses,
+        )
+        conn.commit()
+        conn.close()
+        print("2. Seeded sample expense transactions in test_finance.db.")
+
+        # 3. Call generate_portfolio_chart() with mock breakdown, assert buf.getbuffer().nbytes > 1000
+        mock_breakdown = {
+            "liquid": {
+                "Cash": {"balance": 150000.0, "currency": "IDR"},
+                "BCA": {"balance": 2500000.0, "currency": "IDR"},
+                "Jenius": {"balance": 750000.0, "currency": "IDR"},
+            },
+            "investments": {
+                "Bibit": 6500000.0,
+                "Gotrade": 35.50,
+            },
+            "total_idr": 9900000.0,
+            "total_usd": 35.50,
+        }
+        p_buf = generate_portfolio_chart(mock_breakdown)
+        assert isinstance(p_buf, io.BytesIO), "Expected io.BytesIO buffer"
+        p_bytes = p_buf.getbuffer().nbytes
+        print(f"3. generate_portfolio_chart() produced {p_bytes} bytes (assert > 1000)")
+        assert p_bytes > 1000, f"Portfolio chart buffer too small: {p_bytes} bytes"
+
+        # 4. Call generate_expenses_chart(30, TEST_DB), assert buffer exists and length > 1000
+        e_buf, cat_totals = generate_expenses_chart(30, db_name=TEST_DB)
+        assert e_buf is not None, "Expected expenses chart buffer to exist"
+        e_bytes = e_buf.getbuffer().nbytes
+        print(f"4. generate_expenses_chart() produced {e_bytes} bytes, categories: {cat_totals}")
+        assert e_bytes > 1000, f"Expenses chart buffer too small: {e_bytes} bytes"
+        assert len(cat_totals) == 3, f"Expected 3 expense categories, got {len(cat_totals)}"
+        assert cat_totals.get("Impulse") == 500000.0
+        assert cat_totals.get("Food") == 300000.0
+        assert cat_totals.get("Utilities") == 150000.0
+
+        # 5. Call plt.close('all') and verify no lingering Matplotlib figures
+        plt.close("all")
+        active_fignums = plt.get_fignums()
+        print(f"5. Active Matplotlib figure count: {len(active_fignums)}")
+        assert len(active_fignums) == 0, f"Lingering figures detected: {active_fignums}"
+        print("Part D persona and chart generation verification PASSED cleanly.")
+
+        # 7. Clean up test database files
         for f in [TEST_DB, f"{TEST_DB}-wal", f"{TEST_DB}-shm"]:
             if os.path.exists(f):
                 try:
