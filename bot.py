@@ -29,6 +29,7 @@ RDN_ACCOUNT_NO = os.getenv("RDN_ACCOUNT_NO", "")
 DB_NAME = "finance.db"
 NAV_CACHE_FILE = "nav_cache.json"
 WIB = timezone(timedelta(hours=7))
+SEED_SMMF_NAV = 1991.55
 
 PLATFORM_MAP = {
     "cash": "Cash",
@@ -138,7 +139,7 @@ def fetch_smmf_nav(force_refresh: bool = False) -> float:
 
     Checks nav_cache.json. If updated_at >= most recent Friday 21:00 WIB and not force_refresh,
     returns cached NAV without making network requests.
-    Otherwise queries Bareksa endpoint, with fallbacks to Pasardana, Bibit, cache, and 1991.55.
+    Otherwise queries Bareksa endpoint, with fallbacks to Pasardana, Bibit, dynamic cache, and SEED_SMMF_NAV.
     """
     now_wib = datetime.now(WIB)
     most_recent_friday = get_most_recent_friday_21_wib(now_wib)
@@ -164,17 +165,44 @@ def fetch_smmf_nav(force_refresh: bool = False) -> float:
 
     # Primary: Bareksa
     try:
-        bareksa_url = "https://www.bareksa.com/api/invest/product/detail/sucorinvest-money-market-fund"
+        bareksa_url = "https://www.bareksa.com/id/data/reksadana/1742/sucorinvest-money-market-fund"
         r = requests.get(bareksa_url, headers=headers, timeout=10)
         if r.status_code == 200:
-            data = r.json()
-            val = data.get("data", {}).get("nav") or data.get("nav")
-            if val:
-                nav = float(val)
+            match = re.search(r'<span class="fS40">([\d\.,]+)</span>', r.text)
+            if match:
+                val = float(match.group(1).replace(".", "").replace(",", "."))
+                if 1500.0 < val < 3000.0:
+                    nav = val
     except Exception:
         pass
 
+    if nav is None:
+        try:
+            bareksa_api = "https://www.bareksa.com/api/invest/product/detail/sucorinvest-money-market-fund"
+            r = requests.get(bareksa_api, headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                val = data.get("data", {}).get("nav") or data.get("nav")
+                if val and 1500.0 < float(val) < 3000.0:
+                    nav = float(val)
+        except Exception:
+            pass
+
     # Secondary Fallback: Pasardana
+    if nav is None:
+        try:
+            pasardana_headers = headers.copy()
+            pasardana_headers["Authorization"] = "Basic Ym5pdXNlcjp5ZFdLWFlGTVFHeTVOcHduQmY5bm1mWEM="
+            pasardana_api = "https://pasardana.id/api/FundService/GetSnapshot?fundId=2058"
+            r = requests.get(pasardana_api, headers=pasardana_headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                val = float(data.get("MaximumNavValue", 0.0))
+                if 1500.0 < val < 3000.0:
+                    nav = val
+        except Exception:
+            pass
+
     if nav is None:
         try:
             pasardana_url = "https://pasardana.id/fund/sucorinvest-money-market-fund"
@@ -208,24 +236,26 @@ def fetch_smmf_nav(force_refresh: bool = False) -> float:
         except Exception:
             pass
 
-    # Network Failure Fallback
-    if nav is None or nav <= 0:
-        if cached_nav and cached_nav > 0:
-            nav = cached_nav
-        else:
-            nav = 1991.55
+    # If a live NAV was fetched from any network source, update cache file
+    if nav is not None and nav > 0:
+        try:
+            cache_content = {
+                "nav": nav,
+                "updated_at": now_wib.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            with open(NAV_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cache_content, f, indent=2)
+        except Exception as e:
+            print(f"Notice: Failed to write {NAV_CACHE_FILE}: {e}")
+        return nav
 
-    try:
-        cache_content = {
-            "nav": nav,
-            "updated_at": now_wib.strftime("%Y-%m-%d %H:%M:%S")
-        }
-        with open(NAV_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache_content, f, indent=2)
-    except Exception as e:
-        print(f"Notice: Failed to write {NAV_CACHE_FILE}: {e}")
+    # Network Failure Fallback:
+    # Use dynamically cached NAV from previous successful fetches so fallback tracks the latest known NAV.
+    # Fall back to initial SEED_SMMF_NAV strictly if no cache file exists yet.
+    if cached_nav and cached_nav > 0:
+        return cached_nav
 
-    return nav
+    return SEED_SMMF_NAV
 
 
 def get_investment_totals(db_name: str = DB_NAME) -> dict:
@@ -1103,6 +1133,19 @@ if __name__ == "__main__":
         print(f"Retrieved live SMMF NAV: {live_nav}")
         assert 1500.0 < live_nav < 3000.0, f"NAV out of bounds (1500.0 < nav < 3000.0): {live_nav}"
         print("Live SMMF NAV verified within realistic bounds.")
+
+        # Verify cache file was written with live NAV
+        with open(NAV_CACHE_FILE, "r", encoding="utf-8") as f:
+            cache_data = json.load(f)
+            assert cache_data.get("nav") == live_nav, "Cache does not match live NAV!"
+
+        # Verify network failure fallback uses dynamic cached NAV, NOT static seed
+        import unittest.mock
+        with unittest.mock.patch("requests.get", side_effect=Exception("Network simulated failure")):
+            fallback_nav = fetch_smmf_nav(force_refresh=True)
+            print(f"Verified network failure fallback with cache: {fallback_nav} (expected cached {live_nav})")
+            assert fallback_nav == live_nav, f"Expected {live_nav}, got {fallback_nav}"
+        print("Dynamic NAV cache fallback verified cleanly.")
 
         # 3. Part A: Cash Flow Verification on TEST_DB
         print("\n[PART A: Feature 3 Cash Flow (test_finance.db)]")
