@@ -1526,7 +1526,7 @@ async def checkbalance(interaction: discord.Interaction):
 @app_commands.describe(amount="Amount of cash added in IDR", note="Description or source of cash")
 async def cashin(interaction: discord.Interaction, amount: float, note: str):
     logger.info(f"Command /cashin executed by {interaction.user}: amount={amount}, note='{note}'")
-    new_balance = record_cash_flow(amount, "income", note)
+    new_balance = await asyncio.to_thread(record_cash_flow, amount, "income", note)
     embed = discord.Embed(
         title="💵 Cash Inflow Added",
         color=discord.Color.green()
@@ -1544,7 +1544,7 @@ async def cashin(interaction: discord.Interaction, amount: float, note: str):
 @app_commands.describe(amount="Amount of cash spent in IDR", note="Description or purpose of expense")
 async def cashout(interaction: discord.Interaction, amount: float, note: str):
     logger.info(f"Command /cashout executed by {interaction.user}: amount={amount}, note='{note}'")
-    new_balance = record_cash_flow(amount, "expense", note)
+    new_balance = await asyncio.to_thread(record_cash_flow, amount, "expense", note)
     embed = discord.Embed(
         title="💸 Cash Outflow Logged",
         color=discord.Color.red()
@@ -1562,7 +1562,7 @@ async def cashout(interaction: discord.Interaction, amount: float, note: str):
 @app_commands.describe(days="Number of days to check (default: 7)")
 async def checkactivity(interaction: discord.Interaction, days: int = 7):
     logger.info(f"Command /checkactivity executed by {interaction.user}: days={days}")
-    rows, total_outflow, total_switched = get_recent_activity(days)
+    rows, total_outflow, total_switched = await asyncio.to_thread(get_recent_activity, days)
     embed = discord.Embed(
         title=f"📊 Recent Activity (Last {days} Days)",
         color=discord.Color.gold()
@@ -1599,7 +1599,7 @@ async def checkactivity(interaction: discord.Interaction, days: int = 7):
 @bot.tree.command(name="checkincome", description="List recent income/inflows from the last 7 days")
 async def checkincome(interaction: discord.Interaction):
     logger.info(f"Command /checkincome executed by {interaction.user}")
-    rows, total_amount = get_recent_summary("income", 7)
+    rows, total_amount = await asyncio.to_thread(get_recent_summary, "income", 7)
     embed = discord.Embed(
         title="📈 Inflow / Income (Last 7 Days)",
         color=discord.Color.teal()
@@ -1623,7 +1623,7 @@ async def checkincome(interaction: discord.Interaction):
 @bot.tree.command(name="undo", description="Revert the most recently recorded transaction")
 async def undo(interaction: discord.Interaction):
     logger.info(f"Command /undo executed by {interaction.user}")
-    success, message = undo_last_transaction()
+    success, message = await asyncio.to_thread(undo_last_transaction)
     if success:
         embed = discord.Embed(
             title="🔄 Transaction Reverted",
@@ -1690,7 +1690,7 @@ async def chart_portfolio(interaction: discord.Interaction):
     try:
         await interaction.followup.send(embed=embed, file=chart_file)
     except discord.Forbidden:
-        chart_file.seek(0)
+        chart_file.reset()
         await interaction.followup.send(
             content=f"📊 **Portfolio Allocation**\n\n{commentary}",
             file=chart_file,
@@ -1723,7 +1723,7 @@ async def chart_expenses(interaction: discord.Interaction, days: int = 30):
     try:
         await interaction.followup.send(embed=embed, file=chart_file)
     except discord.Forbidden:
-        chart_file.seek(0)
+        chart_file.reset()
         await interaction.followup.send(
             content=f"💸 **Spending Breakdown (Last {days} Days)**\n\n{commentary}",
             file=chart_file,
@@ -1754,7 +1754,7 @@ async def backup(interaction: discord.Interaction):
         try:
             await interaction.followup.send(embed=embed, file=db_file)
         except discord.Forbidden:
-            db_file.seek(0)
+            db_file.reset()
             await interaction.followup.send(
                 content=f"💾 **Database Backup Created**\n• File: `{filename}`\n• Size: {size_kb:.2f} KB",
                 file=db_file,
