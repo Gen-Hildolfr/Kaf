@@ -5,3 +5,6 @@
 nav_cache.json
 __pycache__/
 *.pyc
+persona.md
+*.log
+backups/

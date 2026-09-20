@@ -7,6 +7,8 @@ import json
 import base64
 import asyncio
 import sqlite3
+import logging
+from logging.handlers import RotatingFileHandler
 import traceback
 import requests
 import discord
@@ -18,6 +20,32 @@ import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+log_formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
+
+file_handler = RotatingFileHandler(
+    "bot.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(log_formatter)
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setLevel(logging.INFO)
+stream_handler.setFormatter(log_formatter)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.handlers.clear()
+root_logger.addHandler(file_handler)
+root_logger.addHandler(stream_handler)
+
+logger = logging.getLogger("kaf")
+logging.getLogger("discord.client").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------
 # Configuration & Constants
@@ -123,6 +151,7 @@ def init_db(db_name: str = DB_NAME) -> None:
 
     conn.commit()
     conn.close()
+    logger.info(f"Initialized SQLite database '{db_name}' in WAL mode.")
 
 
 def perform_db_backup(db_name: str = DB_NAME) -> str:
@@ -137,6 +166,7 @@ def perform_db_backup(db_name: str = DB_NAME) -> str:
         src.backup(dst)
     dst.close()
     src.close()
+    logger.info(f"Created atomic SQLite backup for '{db_name}' at: {backup_path}")
     return backup_path
 
 
@@ -153,6 +183,7 @@ def check_and_run_biweekly_backup(db_name: str = DB_NAME) -> str | None:
             needs_backup = False
 
     if needs_backup:
+        logger.info(f"Biweekly backup check: triggering backup for '{db_name}'")
         return perform_db_backup(db_name)
     return None
 
@@ -199,9 +230,10 @@ def fetch_smmf_nav(force_refresh: bool = False) -> float:
                 if updated_at_str:
                     cached_dt = datetime.strptime(updated_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=WIB)
                     if not force_refresh and cached_dt >= most_recent_friday and cached_nav > 0:
+                        logger.info(f"Using Friday-aligned cached SMMF NAV: {cached_nav}")
                         return cached_nav
         except Exception as e:
-            print(f"Notice: Failed to read {NAV_CACHE_FILE}: {e}")
+            logger.warning(f"Failed to read {NAV_CACHE_FILE}: {e}")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -291,16 +323,16 @@ def fetch_smmf_nav(force_refresh: bool = False) -> float:
             with open(NAV_CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cache_content, f, indent=2)
         except Exception as e:
-            print(f"Notice: Failed to write {NAV_CACHE_FILE}: {e}")
+            logger.warning(f"Failed to write {NAV_CACHE_FILE}: {e}")
+        logger.info(f"Retrieved live SMMF NAV: {nav}")
         return nav
 
     # Network Failure Fallback:
     # Use dynamically cached NAV from previous successful fetches so fallback tracks the latest known NAV.
     # Fall back to initial SEED_SMMF_NAV strictly if no cache file exists yet.
-    if cached_nav and cached_nav > 0:
-        return cached_nav
-
-    return SEED_SMMF_NAV
+    fallback_result = cached_nav if (cached_nav and cached_nav > 0) else SEED_SMMF_NAV
+    logger.info(f"Using fallback SMMF NAV: {fallback_result}")
+    return fallback_result
 
 
 def get_investment_totals(db_name: str = DB_NAME) -> dict:
@@ -905,6 +937,7 @@ def query_unsloth_chat(prompt: str, system_prompt: str = None) -> str:
             {"role": "user", "content": prompt},
         ],
     }
+    logger.info(f"Querying Unsloth chat API (model: {UNSLOTH_MODEL})")
     response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=180)
     response.raise_for_status()
     data = response.json()
@@ -923,7 +956,7 @@ async def get_financial_critique(topic: str, financial_context: str) -> str:
     try:
         return await asyncio.to_thread(query_unsloth_chat, prompt)
     except Exception as e:
-        print(f"Notice: Failed to fetch AI critique from Unsloth: {e}")
+        logger.warning(f"Failed to fetch AI critique from Unsloth: {e}")
         return "I've compiled the ledger breakdown for your review, Master Gen. Do keep your spending disciplined."
 
 
@@ -1003,6 +1036,7 @@ Return STRICT JSON ONLY with schema:
         "temperature": 0.1
     }
 
+    logger.info(f"Querying Unsloth vision API for slip extraction ({len(image_bytes)} bytes, mime={mime_type})")
     response = requests.post(UNSLOTH_API_URL, headers=headers, json=payload, timeout=180)
     response.raise_for_status()
     data = response.json()
@@ -1024,6 +1058,8 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
     note = str(data.get("note") or "").strip()[:1000]
     ticker = data.get("ticker")
     units_added = float(data.get("units_added") or 0.0)
+
+    logger.info(f"Processing slip on '{db_name}': kind='{kind}', platform='{platform}', amount={amount:,.2f}, fee={fee:,.2f}")
 
     # Fallback fee detection from note string if fee was 0
     if fee == 0.0 and note:
@@ -1312,7 +1348,7 @@ def commit_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
     try:
         check_and_run_biweekly_backup(db_name=db_name)
     except Exception as e:
-        print(f"Notice: Failed biweekly backup check after slip processing: {e}")
+        logger.warning(f"Failed biweekly backup check after slip processing: {e}")
     return embed
 
 
@@ -1326,18 +1362,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
+        logger.info(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
+        logger.error(f"Failed to sync slash commands: {e}", exc_info=True)
     try:
         backup_path = check_and_run_biweekly_backup()
         if backup_path:
-            print(f"Biweekly automatic backup created at: {backup_path}")
+            logger.info(f"Biweekly automatic backup created at: {backup_path}")
     except Exception as e:
-        print(f"Failed biweekly backup check: {e}")
+        logger.error(f"Failed biweekly backup check: {e}", exc_info=True)
 
 
 @bot.event
@@ -1353,8 +1389,7 @@ async def on_message(message: discord.Message):
                     reply_text = await asyncio.to_thread(query_unsloth_chat, message.content)
                     await message.reply(reply_text)
                 except Exception as e:
-                    print(f"Chat error: {e}")
-                    traceback.print_exc()
+                    logger.error(f"Chat error: {e}", exc_info=True)
                     try:
                         await message.reply("Sorry, I encountered an error talking to the AI service.")
                     except Exception:
@@ -1376,8 +1411,7 @@ async def on_message(message: discord.Message):
                 data = await asyncio.to_thread(query_unsloth_vision, image_bytes)
                 embed = commit_parsed_slip(data)
             except Exception as e:
-                print(f"Error extracting or processing receipt slip: {e}")
-                traceback.print_exc()
+                logger.error(f"Error extracting or processing receipt slip: {e}", exc_info=True)
                 try:
                     await message.reply(
                         "❌ Unable to parse this receipt or financial slip. "
@@ -1399,10 +1433,9 @@ async def on_message(message: discord.Message):
                         "Please grant **Embed Links** to the bot role in your Discord Server Settings to see rich styled cards!"
                     )
                 except discord.Forbidden:
-                    print(f"Error: Bot lacks permission to send messages in channel {message.channel.id}")
+                    logger.error(f"Bot lacks permission to send messages in channel {message.channel.id}")
             except Exception as e:
-                print(f"Error sending embed response: {e}")
-                traceback.print_exc()
+                logger.error(f"Error sending embed response: {e}", exc_info=True)
     else:
         if message.content.strip():
             async with message.channel.typing():
@@ -1410,8 +1443,7 @@ async def on_message(message: discord.Message):
                     reply_text = await asyncio.to_thread(query_unsloth_chat, message.content)
                     await message.reply(reply_text)
                 except Exception as e:
-                    print(f"Chat error: {e}")
-                    traceback.print_exc()
+                    logger.error(f"Chat error: {e}", exc_info=True)
                     try:
                         await message.reply("Sorry, I encountered an error talking to the AI service.")
                     except Exception:
@@ -1423,6 +1455,7 @@ async def on_message(message: discord.Message):
 # ---------------------------------------------------------
 @bot.tree.command(name="checkbalance", description="View portfolio and balance breakdown across all accounts")
 async def checkbalance(interaction: discord.Interaction):
+    logger.info(f"Command /checkbalance executed by {interaction.user}")
     await interaction.response.defer()
     breakdown = get_balance_breakdown()
 
@@ -1472,6 +1505,7 @@ async def checkbalance(interaction: discord.Interaction):
 @bot.tree.command(name="cashin", description="Record cash inflow/income to your physical wallet")
 @app_commands.describe(amount="Amount of cash added in IDR", note="Description or source of cash")
 async def cashin(interaction: discord.Interaction, amount: float, note: str):
+    logger.info(f"Command /cashin executed by {interaction.user}: amount={amount}, note='{note}'")
     new_balance = record_cash_flow(amount, "income", note)
     embed = discord.Embed(
         title="💵 Cash Inflow Added",
@@ -1489,6 +1523,7 @@ async def cashin(interaction: discord.Interaction, amount: float, note: str):
 @bot.tree.command(name="cashout", description="Record cash outflow/expense from your physical wallet")
 @app_commands.describe(amount="Amount of cash spent in IDR", note="Description or purpose of expense")
 async def cashout(interaction: discord.Interaction, amount: float, note: str):
+    logger.info(f"Command /cashout executed by {interaction.user}: amount={amount}, note='{note}'")
     new_balance = record_cash_flow(amount, "expense", note)
     embed = discord.Embed(
         title="💸 Cash Outflow Logged",
@@ -1506,6 +1541,7 @@ async def cashout(interaction: discord.Interaction, amount: float, note: str):
 @bot.tree.command(name="checkactivity", description="List recent activity (expenses, outgoing transfers, balance switching) from the last N days")
 @app_commands.describe(days="Number of days to check (default: 7)")
 async def checkactivity(interaction: discord.Interaction, days: int = 7):
+    logger.info(f"Command /checkactivity executed by {interaction.user}: days={days}")
     rows, total_outflow, total_switched = get_recent_activity(days)
     embed = discord.Embed(
         title=f"📊 Recent Activity (Last {days} Days)",
@@ -1542,6 +1578,7 @@ async def checkactivity(interaction: discord.Interaction, days: int = 7):
 
 @bot.tree.command(name="checkincome", description="List recent income/inflows from the last 7 days")
 async def checkincome(interaction: discord.Interaction):
+    logger.info(f"Command /checkincome executed by {interaction.user}")
     rows, total_amount = get_recent_summary("income", 7)
     embed = discord.Embed(
         title="📈 Inflow / Income (Last 7 Days)",
@@ -1565,6 +1602,7 @@ async def checkincome(interaction: discord.Interaction):
 
 @bot.tree.command(name="undo", description="Revert the most recently recorded transaction")
 async def undo(interaction: discord.Interaction):
+    logger.info(f"Command /undo executed by {interaction.user}")
     success, message = undo_last_transaction()
     if success:
         embed = discord.Embed(
@@ -1592,6 +1630,7 @@ chart_group = app_commands.Group(name="chart", description="Visual charts and Ka
 
 @chart_group.command(name="portfolio", description="View dark-themed donut chart of asset allocation with Kaf's commentary")
 async def chart_portfolio(interaction: discord.Interaction):
+    logger.info(f"Command /chart portfolio executed by {interaction.user}")
     await interaction.response.defer()
     breakdown = get_balance_breakdown()
     buf = generate_portfolio_chart(breakdown)
@@ -1636,6 +1675,7 @@ async def chart_portfolio(interaction: discord.Interaction):
 @chart_group.command(name="expenses", description="View horizontal bar chart of recent expenses with Kaf's commentary")
 @app_commands.describe(days="Number of days to analyze (default: 30)")
 async def chart_expenses(interaction: discord.Interaction, days: int = 30):
+    logger.info(f"Command /chart expenses executed by {interaction.user}: days={days}")
     await interaction.response.defer()
     buf, cat_totals = generate_expenses_chart(days=days)
     if buf is None:
@@ -1669,6 +1709,7 @@ bot.tree.add_command(chart_group)
 
 @bot.tree.command(name="backup", description="Create an atomic SQLite backup and upload the .db file")
 async def backup(interaction: discord.Interaction):
+    logger.info(f"Command /backup executed by {interaction.user}")
     await interaction.response.defer()
     try:
         backup_path = perform_db_backup(DB_NAME)
@@ -1693,8 +1734,7 @@ async def backup(interaction: discord.Interaction):
                 file=db_file,
             )
     except Exception as e:
-        print(f"Backup command error: {e}")
-        traceback.print_exc()
+        logger.error(f"Backup command error: {e}", exc_info=True)
         await interaction.followup.send(f"❌ Failed to create database backup: {e}")
 
 
@@ -1706,6 +1746,8 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
 
     if "--test" in sys.argv:
+        # Keep --test CLI output clean and readable on stdout while bot.log records full INFO logs
+        stream_handler.setLevel(logging.WARNING)
         print("=== RUNNING CLI SMOKE TEST (--test) ===")
         TEST_DB = "test_finance.db"
 
@@ -2015,7 +2057,23 @@ if __name__ == "__main__":
         print("5 & 6. Cleaned up test backup files cleanly.")
         print("Part E database backup verification PASSED cleanly.")
 
-        # 8. Clean up test database files
+        # 8. Part F: Rotating File Logging Verification
+        print("\n[PART F: Rotating File Logging Verification]")
+        test_log_msg = f"Smoke test log entry at {datetime.now().isoformat()}"
+        logger.info(test_log_msg)
+        for h in root_logger.handlers:
+            h.flush()
+        for h in logger.handlers:
+            h.flush()
+
+        assert os.path.exists("bot.log"), "bot.log file does not exist!"
+        with open("bot.log", "r", encoding="utf-8") as f:
+            log_content = f.read()
+        assert test_log_msg in log_content, "Test log message not found in bot.log!"
+        print(f"Verified logger successfully writes to bot.log ({len(log_content)} bytes).")
+        print("Part F logging verification PASSED cleanly.")
+
+        # 9. Clean up test database files
         for f in [TEST_DB, f"{TEST_DB}-wal", f"{TEST_DB}-shm"]:
             if os.path.exists(f):
                 try:
@@ -2027,7 +2085,7 @@ if __name__ == "__main__":
     else:
         init_db(DB_NAME)
         if DISCORD_TOKEN:
-            print("Starting Discord bot...")
+            logger.info("Starting Discord bot...")
             bot.run(DISCORD_TOKEN)
         else:
-            print("ERROR: DISCORD_TOKEN not found in environment variables.")
+            logger.error("DISCORD_TOKEN not found in environment variables.")
