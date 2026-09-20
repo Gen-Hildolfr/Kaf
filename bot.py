@@ -2,6 +2,7 @@ import io
 import os
 import sys
 import re
+import glob
 import json
 import base64
 import asyncio
@@ -31,6 +32,7 @@ BCA_ACCOUNT_NO = os.getenv("BCA_ACCOUNT_NO", "")
 JENIUS_ACCOUNT_NO = os.getenv("JENIUS_ACCOUNT_NO", "")
 RDN_ACCOUNT_NO = os.getenv("RDN_ACCOUNT_NO", "")
 DB_NAME = "finance.db"
+BACKUP_DIR = "backups"
 NAV_CACHE_FILE = "nav_cache.json"
 WIB = timezone(timedelta(hours=7))
 SEED_SMMF_NAV = 1991.55
@@ -121,6 +123,38 @@ def init_db(db_name: str = DB_NAME) -> None:
 
     conn.commit()
     conn.close()
+
+
+def perform_db_backup(db_name: str = DB_NAME) -> str:
+    """Safely creates an atomic SQLite backup using the backup API."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = os.path.join(BACKUP_DIR, f"finance_backup_{timestamp}.db")
+
+    src = sqlite3.connect(db_name)
+    dst = sqlite3.connect(backup_path)
+    with dst:
+        src.backup(dst)
+    dst.close()
+    src.close()
+    return backup_path
+
+
+def check_and_run_biweekly_backup(db_name: str = DB_NAME) -> str | None:
+    """Runs a backup if the last backup is older than 14 days or doesn't exist."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    existing_backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "finance_backup_*.db")))
+
+    needs_backup = True
+    if existing_backups:
+        latest_backup = existing_backups[-1]
+        mtime = datetime.fromtimestamp(os.path.getmtime(latest_backup))
+        if datetime.now() - mtime < timedelta(days=14):
+            needs_backup = False
+
+    if needs_backup:
+        return perform_db_backup(db_name)
+    return None
 
 
 def get_most_recent_friday_21_wib(now_dt: datetime) -> datetime:
@@ -1272,6 +1306,16 @@ def process_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
     raise ValueError(f"Unknown slip kind: {kind}")
 
 
+def commit_parsed_slip(data: dict, db_name: str = DB_NAME) -> discord.Embed:
+    """Commits a parsed slip to the database and runs the biweekly backup check."""
+    embed = process_parsed_slip(data, db_name=db_name)
+    try:
+        check_and_run_biweekly_backup(db_name=db_name)
+    except Exception as e:
+        print(f"Notice: Failed biweekly backup check after slip processing: {e}")
+    return embed
+
+
 # ---------------------------------------------------------
 # Discord Bot Setup & Event Listeners
 # ---------------------------------------------------------
@@ -1288,6 +1332,12 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
         print(f"Failed to sync slash commands: {e}")
+    try:
+        backup_path = check_and_run_biweekly_backup()
+        if backup_path:
+            print(f"Biweekly automatic backup created at: {backup_path}")
+    except Exception as e:
+        print(f"Failed biweekly backup check: {e}")
 
 
 @bot.event
@@ -1324,7 +1374,7 @@ async def on_message(message: discord.Message):
             try:
                 image_bytes = await first_attachment.read()
                 data = await asyncio.to_thread(query_unsloth_vision, image_bytes)
-                embed = process_parsed_slip(data)
+                embed = commit_parsed_slip(data)
             except Exception as e:
                 print(f"Error extracting or processing receipt slip: {e}")
                 traceback.print_exc()
@@ -1617,6 +1667,37 @@ async def chart_expenses(interaction: discord.Interaction, days: int = 30):
 bot.tree.add_command(chart_group)
 
 
+@bot.tree.command(name="backup", description="Create an atomic SQLite backup and upload the .db file")
+async def backup(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        backup_path = perform_db_backup(DB_NAME)
+        size_kb = os.path.getsize(backup_path) / 1024.0
+        filename = os.path.basename(backup_path)
+
+        embed = discord.Embed(
+            title="💾 Database Backup Created",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="Filename", value=f"`{filename}`", inline=True)
+        embed.add_field(name="File Size", value=f"{size_kb:.2f} KB", inline=True)
+        embed.set_footer(text="WAL-safe atomic SQLite snapshot")
+
+        db_file = discord.File(backup_path, filename=filename)
+        try:
+            await interaction.followup.send(embed=embed, file=db_file)
+        except discord.Forbidden:
+            db_file.seek(0)
+            await interaction.followup.send(
+                content=f"💾 **Database Backup Created**\n• File: `{filename}`\n• Size: {size_kb:.2f} KB",
+                file=db_file,
+            )
+    except Exception as e:
+        print(f"Backup command error: {e}")
+        traceback.print_exc()
+        await interaction.followup.send(f"❌ Failed to create database backup: {e}")
+
+
 # ---------------------------------------------------------
 # Main Entry Point & Smoke Test
 # ---------------------------------------------------------
@@ -1881,7 +1962,60 @@ if __name__ == "__main__":
         assert len(active_fignums) == 0, f"Lingering figures detected: {active_fignums}"
         print("Part D persona and chart generation verification PASSED cleanly.")
 
-        # 7. Clean up test database files
+        # 7. Part E: Feature 8 Database Backup Verification
+        print("\n[PART E: Feature 8 Database Backup Verification]")
+        # 1. Insert a sample record into test_finance.db
+        conn = sqlite3.connect(TEST_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO transactions (platform, type, amount, category, note) VALUES (?, ?, ?, ?, ?)",
+            ("BCA", "expense", 77777.0, "TestCategory", "Backup verification note"),
+        )
+        conn.commit()
+        conn.close()
+        print("1. Seeded sample record in test_finance.db for backup verification.")
+
+        # 2. Run backup_path = perform_db_backup(TEST_DB)
+        backup_path = perform_db_backup(TEST_DB)
+        print(f"2. perform_db_backup(TEST_DB) returned: {backup_path}")
+
+        # 3. Verify os.path.exists(backup_path)
+        assert os.path.exists(backup_path), f"Backup file does not exist: {backup_path}"
+        print(f"3. Verified backup file exists at {backup_path}")
+
+        # 4. Open backup_path with sqlite3 and verify the sample record exists inside the backup file
+        backup_conn = sqlite3.connect(backup_path)
+        backup_cur = backup_conn.cursor()
+        backup_cur.execute("SELECT amount, note FROM transactions WHERE category = 'TestCategory'")
+        backup_row = backup_cur.fetchone()
+        backup_conn.close()
+        assert backup_row is not None, "Sample record not found inside backup database!"
+        assert backup_row[0] == 77777.0 and backup_row[1] == "Backup verification note", f"Record mismatch in backup: {backup_row}"
+        print(f"4. Verified record inside backup database: {backup_row}")
+
+        # 5. Remove test backup artifacts cleanly
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
+        # 6. Verify check_and_run_biweekly_backup logic
+        biweekly_res = check_and_run_biweekly_backup(TEST_DB)
+        print(f"6a. Biweekly check initial run: {biweekly_res}")
+        assert biweekly_res is not None and os.path.exists(biweekly_res)
+        biweekly_second = check_and_run_biweekly_backup(TEST_DB)
+        print(f"6b. Biweekly check immediate second run (<14 days): {biweekly_second}")
+        assert biweekly_second is None, f"Expected None on second run, got {biweekly_second}"
+        if os.path.exists(biweekly_res):
+            os.remove(biweekly_res)
+
+        if os.path.exists(BACKUP_DIR) and not os.listdir(BACKUP_DIR):
+            try:
+                os.rmdir(BACKUP_DIR)
+            except Exception:
+                pass
+        print("5 & 6. Cleaned up test backup files cleanly.")
+        print("Part E database backup verification PASSED cleanly.")
+
+        # 8. Clean up test database files
         for f in [TEST_DB, f"{TEST_DB}-wal", f"{TEST_DB}-shm"]:
             if os.path.exists(f):
                 try:
